@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Data (too large for git)
+data/*.pt
+data_shuffled/
+zeros/
+
+# Model outputs
+out/
+out_*/
+outputs/
+
+# Julia (PySR)
+.julia/
+julia_env/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
