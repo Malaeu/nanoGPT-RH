@@ -139,7 +139,7 @@ MARGIN = +2.928
 ```
 
 ![Spectral Gap](Q3_Spectral_Gap_Proof.png)
-*Figure 3: (A) Learned kernel from attention. (B) Q3 symbol with spectral gap proof.*
+*Figure 3: (A) Learned correlation kernel μ(d) showing damped oscillations with period ≈17.6. (B) Q3 Toeplitz symbol P_A(θ) with floor c*=1.1 (red line). The symbol minimum (4.03) lies well above the floor, giving margin +2.93. Green region indicates safe spectral zone where Q ≥ 0.*
 
 ---
 
