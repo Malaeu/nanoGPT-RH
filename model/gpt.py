@@ -48,7 +48,7 @@ class CausalSelfAttention(nn.Module):
             .view(1, 1, config.seq_len, config.seq_len)
         )
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         B, T, C = x.size()
 
         # Calculate query, key, value
@@ -61,12 +61,16 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
+        att_weights = att  # Save before dropout for analysis
         att = self.attn_dropout(att)
         y = att @ v
 
         # Re-assemble heads
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
+
+        if return_attention:
+            return y, att_weights
         return y
 
 
@@ -98,10 +102,16 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, x, return_attention=False):
+        if return_attention:
+            attn_out, attn_weights = self.attn(self.ln_1(x), return_attention=True)
+            x = x + attn_out
+            x = x + self.mlp(self.ln_2(x))
+            return x, attn_weights
+        else:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+            return x
 
 
 class SpacingGPT(nn.Module):
@@ -146,15 +156,17 @@ class SpacingGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_attention=False):
         """
         Args:
             idx: (B, T) tensor of token indices
             targets: (B, T) tensor of target indices (optional)
+            return_attention: if True, return attention weights from all layers
 
         Returns:
             logits: (B, T, vocab_size)
             loss: scalar if targets provided
+            attentions: list of attention weights if return_attention=True
         """
         device = idx.device
         B, T = idx.size()
@@ -169,8 +181,13 @@ class SpacingGPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
 
         # Transformer blocks
+        attentions = []
         for block in self.transformer.h:
-            x = block(x)
+            if return_attention:
+                x, attn = block(x, return_attention=True)
+                attentions.append(attn)
+            else:
+                x = block(x)
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
@@ -185,6 +202,8 @@ class SpacingGPT(nn.Module):
                 ignore_index=-1
             )
 
+        if return_attention:
+            return logits, loss, attentions
         return logits, loss
 
     def get_hidden_states(self, idx):
