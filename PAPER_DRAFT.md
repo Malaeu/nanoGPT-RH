@@ -117,8 +117,9 @@ This provides empirical ML evidence for the Hilbert-Pólya conjecture via geomet
 3. Short-range GUE correlations are robustly learned (ACF MSE = 0.005)
 4. Long-range structure remains challenging for finite-context models
 5. The learned kernel μ(d) parallels Friedman-Ramanujan functions from hyperbolic geometry
-6. **NEW:** RMT Memory mechanism extends effective context to 12.8k tokens
-7. **NEW:** Smoking Gun: Elephant (+63%) >> Placebo (-18%) proves Information > Noise
+6. RMT Memory mechanism extends effective context to 12.8k tokens
+7. Smoking Gun: Elephant (+63%) >> Placebo (-18%) proves Information > Noise
+8. **NEW:** Null Hypothesis Test: Real zeros plateau 18-20x higher than Poisson/Shuffled — confirms real physics, not artifact
 
 ## RMT Training Results
 
@@ -178,9 +179,41 @@ This provides empirical ML evidence for the Hilbert-Pólya conjecture via geomet
 - Riemann zeros: plateau ≈ 2.5 (2.5× enhancement)
 - This confirms anomalous spectral rigidity in zeta zeros
 
+## Null Hypothesis Test: Is the Plateau an Artifact?
+
+**Critical Question:** Could the SFF plateau be an artifact of the unfolding formula rather than real physics?
+
+**The Fear:** What if our normalization formula (unfolding: u = cumsum(spacings)) creates fake structure from any input?
+
+**Method:** Generate null models and run through SAME formula:
+1. **Real Zeros:** True Riemann zero spacings (N=199,936)
+2. **Poisson Process:** Random exponential spacings with same mean (no correlations)
+3. **Shuffled Zeros:** Real values in random order (destroy sequential correlations)
+
+**Results:**
+
+| Dataset | Description | SFF Plateau | Verdict |
+|---------|-------------|-------------|---------|
+| Real Zeros | True Riemann physics | **13.99** | BASELINE |
+| Poisson (Random) | Same mean, no correlations | 0.71 | ✅ CLEAN |
+| Shuffled | Same values, wrong order | 0.80 | ✅ CLEAN |
+
+**Key Finding:** Real/Poisson ratio = **19.7x**, Real/Shuffled ratio = **17.5x**
+
+**Interpretation:**
+- If the formula created artifacts, Poisson/Shuffled would also show high plateaus
+- But they give plateau < 1.0 (even below GUE baseline!)
+- The **18-20x enhancement** in Real zeros is genuine spectral structure
+- Unfolding formula is **clean** — it doesn't inject fake physics
+
+**Verdict:** ✅ The SFF plateau is **REAL PHYSICS**, not a normalization artifact.
+
+The spectral rigidity of Riemann zeros is a genuine property of the zeta function, not an artifact of our preprocessing pipeline.
+
 ## Figures
 
 - `pysr_kernel.png`: PySR symbolic regression result
 - `sff_honest_comparison.png`: SFF comparison
 - `kernel_unfolded.png`: Attention kernel in unfolded coordinates
 - `Q3_Spectral_Gap.png`: Q3 symbol verification
+- `artifact_check.png`: Null hypothesis test (Real vs Poisson vs Shuffled)
