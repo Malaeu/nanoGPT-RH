@@ -137,7 +137,7 @@ class MemoryBankGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, return_hidden=False):
         B, T = idx.shape
 
         # Embeddings
@@ -149,16 +149,29 @@ class MemoryBankGPT(nn.Module):
         x, mem_attn = self.memory_bank(x)
 
         # Transformer blocks with causal mask
-        mask = self.mask[:T, :T]
+        causal_mask = self.mask[:T, :T]
         for block in self.blocks:
-            x = block(x, src_mask=mask, is_causal=True)
+            x = block(x, src_mask=causal_mask, is_causal=True)
 
+        # Hidden states for gradient analysis
+        hidden_pre_ln = x
         x = self.ln_f(x)
+        hidden_post_ln = x
+
         logits = self.head(x)
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        if return_hidden:
+            return {
+                "logits": logits,
+                "loss": loss,
+                "hidden_pre_ln": hidden_pre_ln,
+                "hidden_post_ln": hidden_post_ln,
+                "mem_attn": mem_attn,
+            }
 
         return logits, loss, mem_attn
 
