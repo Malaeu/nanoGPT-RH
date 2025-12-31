@@ -279,12 +279,13 @@ class SpacingMDNMemory(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, return_attention=False, collect_memory_stats=False):
+    def forward(self, x, return_attention=False, collect_memory_stats=False, slot_off: int | None = None):
         """
         Args:
             x: (B, T) continuous spacing values
             return_attention: return attention weights for all layers
             collect_memory_stats: update memory attention statistics
+            slot_off: if not None, zero out this memory slot (for ablation)
 
         Returns:
             pi, mu, sigma: MDN parameters for positions AFTER memory prefix
@@ -296,6 +297,11 @@ class SpacingMDNMemory(nn.Module):
 
         # Get memory tokens
         memory = self.memory_bank(B, device)  # (B, M, D)
+
+        # --- SLOT OFF HOOK (for slot_effect_norm ablation) ---
+        if slot_off is not None:
+            memory = memory.clone()
+            memory[:, slot_off, :] = 0.0
 
         # Project input values
         x = x.unsqueeze(-1)  # (B, T, 1)
@@ -354,6 +360,38 @@ class SpacingMDNMemory(nn.Module):
             {'params': other_params, 'lr': base_lr},
             {'params': memory_params, 'lr': base_lr * memory_lr_mult},
         ]
+
+
+# ============================================================================
+# SLOT EFFECT NORM (ablation metric for real slot importance)
+# ============================================================================
+
+@torch.no_grad()
+def slot_effect_norm(model, x, n_slots: int):
+    """
+    Measure real importance of each memory slot via ablation.
+
+    Returns: list[float] length n_slots.
+    Each value = mean absolute change in mixture-mean prediction when slot i is zeroed.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    x = x.to(device)
+
+    # Get underlying model if compiled
+    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
+    # baseline
+    pi, mu, sigma, _ = model(x, slot_off=None)
+    base = (pi * mu).sum(dim=-1)  # (B,T)
+
+    effects = []
+    for i in range(n_slots):
+        pi2, mu2, sig2, _ = model(x, slot_off=i)
+        out = (pi2 * mu2).sum(dim=-1)
+        effects.append((base - out).abs().mean().item())
+
+    return effects
 
 
 # ============================================================================
@@ -602,6 +640,17 @@ def train(args):
                     f"Time: {time_str} | Δ: {delta_str} | "
                     f"ETA: {eta_sec/60:.1f}m"
                 )
+
+                # --- SLOT EFFECT NORM (real importance, every 1000 steps) ---
+                if step % 1000 == 0:
+                    try:
+                        xb = val_data[:8].to(device)  # small probe batch
+                        effects = slot_effect_norm(model, xb, n_slots=args.n_memory_slots)
+                        top_eff = int(max(range(len(effects)), key=lambda k: effects[k]))
+                        eff_str = " ".join([f"{e:.3g}" for e in effects])
+                        console.print(f"  [dim]slot_effect_norm: [{eff_str}] top={top_eff}[/]")
+                    except Exception as e:
+                        console.print(f"  [red]slot_effect_norm error: {e}[/]")
 
                 # Save best
                 if val_nll.item() < best_val_nll:
