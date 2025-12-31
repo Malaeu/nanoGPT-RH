@@ -416,6 +416,79 @@ def slot_effect_norm(model, x, n_slots: int):
 
 
 # ============================================================================
+# ROLLOUT DRIFT LOSS (aux for teaching memory to hold focus)
+# ============================================================================
+
+def rollout_drift_loss(
+    model,
+    x,                      # (B, T) raw spacings
+    start: int = 10,
+    H: int = 10,
+    detach_ctx: bool = True,
+    weight_schedule: str = "linear",  # "linear", "final", or "uniform"
+):
+    """
+    Short-rollout drift loss: teaches memory to reduce cumulative drift.
+
+    Runs H-step autoregressive rollout, compares cumsum of predictions vs ground truth.
+    This is the key aux loss for making memory work as "global lens" not "local conditioner".
+
+    Args:
+        model: SpacingMDNMemory
+        x: (B, T) raw spacing values
+        start: burn-in position where rollout starts
+        H: rollout horizon
+        detach_ctx: if True, stop-grad through feeding predictions (truncated BPTT)
+        weight_schedule: how to weight errors across horizon
+
+    Returns:
+        scalar drift loss
+    """
+    B, T = x.shape
+    device = x.device
+
+    # Ground truth segment
+    gt = x[:, start:start+H]             # (B, H)
+    gt_cum = gt.cumsum(dim=1)            # (B, H)
+
+    # Context begins with true prefix
+    ctx = x[:, :start].clone()           # (B, start)
+
+    preds = []
+    for j in range(H):
+        # Model expects (B, T) input - use current context length
+        # Our model handles variable length internally via positional embeddings
+        pi, mu, sigma, _ = model(ctx)
+
+        # Get prediction for last position
+        pi_t = pi[:, -1, :]   # (B, K)
+        mu_t = mu[:, -1, :]   # (B, K)
+
+        s_next = (pi_t * mu_t).sum(dim=-1, keepdim=True)  # (B, 1)
+        preds.append(s_next)
+
+        # Feed prediction into context
+        if detach_ctx:
+            ctx = torch.cat([ctx, s_next.detach()], dim=1)
+        else:
+            ctx = torch.cat([ctx, s_next], dim=1)
+
+    pred = torch.cat(preds, dim=1)        # (B, H)
+    pred_cum = pred.cumsum(dim=1)         # (B, H)
+
+    # Weight schedule across horizon
+    if weight_schedule == "linear":
+        w = torch.linspace(1.0/H, 1.0, H, device=device).view(1, H)
+        loss = ((pred_cum - gt_cum).abs() * w).mean()
+    elif weight_schedule == "final":
+        loss = (pred_cum[:, -1] - gt_cum[:, -1]).abs().mean()
+    else:  # uniform
+        loss = (pred_cum - gt_cum).abs().mean()
+
+    return loss
+
+
+# ============================================================================
 # TRAINING
 # ============================================================================
 
@@ -463,7 +536,9 @@ def train(args):
     if args.use_slot_id:
         console.print("[cyan]  Slot-ID embeddings: ENABLED (breaks permutation invariance)[/]")
     if use_aux:
-        console.print(f"[cyan]  Aux loss: ENABLED (weight={args.aux_loss_weight})[/]")
+        console.print(f"[cyan]  Aux loss (window-stats): ENABLED (weight={args.aux_loss_weight})[/]")
+    if args.drift_aux_weight > 0:
+        console.print(f"[cyan]  Drift aux (rollout h={args.drift_aux_horizon}): ENABLED (weight={args.drift_aux_weight}, every {args.drift_aux_every} steps)[/]")
 
     # torch.compile for faster training (PyTorch 2.0+)
     if args.compile and device.type == "cuda":
@@ -574,12 +649,24 @@ def train(args):
                 pi, mu, sigma, aux_preds = model(x, collect_memory_stats=collect_stats)
                 loss, nll, entropy = mdn_loss(pi, mu, sigma, y, args.entropy_reg)
 
-                # Auxiliary loss: memory predicts window statistics
+                # Auxiliary loss: memory predicts window statistics (legacy)
                 if args.aux_loss_weight > 0 and aux_preds is not None:
                     # Compute window stats from FULL sequence (before splitting)
                     window_stats = compute_window_stats(batch)  # (B, 4)
                     aux_loss = F.mse_loss(aux_preds, window_stats)
                     loss = loss + args.aux_loss_weight * aux_loss
+
+                # Drift aux: short-rollout cumulative loss (recommended for E1+)
+                if args.drift_aux_weight > 0 and (step % args.drift_aux_every == 0):
+                    # Random batch for drift aux (avoid overfitting to fixed windows)
+                    drift_idx = torch.randint(0, len(train_data), (args.drift_aux_batch,))
+                    drift_batch = train_data[drift_idx].to(device)
+                    drift_loss = rollout_drift_loss(
+                        model, drift_batch,
+                        start=10, H=args.drift_aux_horizon,
+                        detach_ctx=True, weight_schedule="linear"
+                    )
+                    loss = loss + args.drift_aux_weight * drift_loss
 
             # Backward
             optimizer.zero_grad()
@@ -830,7 +917,17 @@ def main():
     parser.add_argument("--no-slot-id", dest="use_slot_id", action="store_false",
                         help="Disable slot-ID embeddings (v0 behavior)")
     parser.add_argument("--aux-loss-weight", type=float, default=0.0,
-                        help="Weight for aux loss (0=disabled, 0.1=recommended)")
+                        help="Weight for window-stats aux loss (0=disabled, legacy)")
+
+    # Drift aux (recommended for E1+)
+    parser.add_argument("--drift-aux-weight", type=float, default=0.0,
+                        help="Weight for rollout drift aux loss (0=disabled, 0.01=recommended)")
+    parser.add_argument("--drift-aux-every", type=int, default=20,
+                        help="Apply drift aux every N steps")
+    parser.add_argument("--drift-aux-batch", type=int, default=16,
+                        help="Batch size for drift aux rollout")
+    parser.add_argument("--drift-aux-horizon", type=int, default=10,
+                        help="Rollout horizon for drift aux")
 
     # Training
     parser.add_argument("--batch-size", type=int, default=512)
