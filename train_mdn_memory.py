@@ -371,27 +371,30 @@ def slot_effect_norm(model, x, n_slots: int):
     """
     Measure real importance of each memory slot via ablation.
 
-    Returns: list[float] length n_slots.
-    Each value = mean absolute change in mixture-mean prediction when slot i is zeroed.
+    Returns: (effects_l1, effects_l2) - two lists of length n_slots.
+    L1 = mean absolute change, L2 = RMS change in mixture-mean prediction.
+
+    Note: pi, mu, sigma are already (B, T, K) without memory prefix
+    (forward() removes memory positions before MDN head).
     """
     model.eval()
     device = next(model.parameters()).device
     x = x.to(device)
 
-    # Get underlying model if compiled
-    base_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-
     # baseline
     pi, mu, sigma, _ = model(x, slot_off=None)
-    base = (pi * mu).sum(dim=-1)  # (B,T)
+    base = (pi * mu).sum(dim=-1)  # (B,T) - mixture mean
 
-    effects = []
+    effects_l1 = []
+    effects_l2 = []
     for i in range(n_slots):
         pi2, mu2, sig2, _ = model(x, slot_off=i)
         out = (pi2 * mu2).sum(dim=-1)
-        effects.append((base - out).abs().mean().item())
+        diff = base - out
+        effects_l1.append(diff.abs().mean().item())
+        effects_l2.append((diff ** 2).mean().sqrt().item())
 
-    return effects
+    return effects_l1, effects_l2
 
 
 # ============================================================================
@@ -645,10 +648,12 @@ def train(args):
                 if step % 1000 == 0:
                     try:
                         xb = val_data[:8].to(device)  # small probe batch
-                        effects = slot_effect_norm(model, xb, n_slots=args.n_memory_slots)
-                        top_eff = int(max(range(len(effects)), key=lambda k: effects[k]))
-                        eff_str = " ".join([f"{e:.3g}" for e in effects])
-                        console.print(f"  [dim]slot_effect_norm: [{eff_str}] top={top_eff}[/]")
+                        eff_l1, eff_l2 = slot_effect_norm(model, xb, n_slots=args.n_memory_slots)
+                        top_l1 = int(max(range(len(eff_l1)), key=lambda k: eff_l1[k]))
+                        l1_str = " ".join([f"{e:.3g}" for e in eff_l1])
+                        l2_str = " ".join([f"{e:.3g}" for e in eff_l2])
+                        console.print(f"  [dim]slot_effect L1: [{l1_str}] top={top_l1}[/]")
+                        console.print(f"  [dim]slot_effect L2: [{l2_str}][/]")
                     except Exception as e:
                         console.print(f"  [red]slot_effect_norm error: {e}[/]")
 
