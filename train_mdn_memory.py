@@ -366,6 +366,24 @@ class SpacingMDNMemory(nn.Module):
 # SLOT EFFECT NORM (ablation metric for real slot importance)
 # ============================================================================
 
+def _bar(x: float, max_x: float, width: int = 20) -> str:
+    """ASCII bar for visualizing slot importance."""
+    if max_x <= 0:
+        return ""
+    n = int(round(width * (x / max_x)))
+    return "█" * n
+
+
+def format_slot_effects(effects: list[float], width: int = 20) -> tuple[int, str]:
+    """Format slot effects as ASCII bar chart."""
+    mx = max(effects) if effects else 0.0
+    lines = []
+    for i, e in enumerate(effects):
+        lines.append(f"  slot {i}: {e:7.4f} {_bar(e, mx, width)}")
+    top = int(max(range(len(effects)), key=lambda k: effects[k])) if effects else -1
+    return top, "\n".join(lines)
+
+
 @torch.no_grad()
 def slot_effect_norm(model, x, n_slots: int):
     """
@@ -523,6 +541,7 @@ def train(args):
 
     # For memory diagnostics
     grad_norms_per_slot = []
+    slot_effect_history = []  # track slot importance over training
 
     with Progress(
         SpinnerColumn(),
@@ -649,11 +668,21 @@ def train(args):
                     try:
                         xb = val_data[:8].to(device)  # small probe batch
                         eff_l1, eff_l2 = slot_effect_norm(model, xb, n_slots=args.n_memory_slots)
-                        top_l1 = int(max(range(len(eff_l1)), key=lambda k: eff_l1[k]))
-                        l1_str = " ".join([f"{e:.3g}" for e in eff_l1])
-                        l2_str = " ".join([f"{e:.3g}" for e in eff_l2])
-                        console.print(f"  [dim]slot_effect L1: [{l1_str}] top={top_l1}[/]")
-                        console.print(f"  [dim]slot_effect L2: [{l2_str}][/]")
+                        top_l1, chart = format_slot_effects(eff_l1)
+
+                        # Log to history
+                        slot_effect_history.append({
+                            "step": step,
+                            "effects_l1": eff_l1,
+                            "effects_l2": eff_l2,
+                            "top_slot": top_l1,
+                            "top_value": max(eff_l1) if eff_l1 else 0.0,
+                            "val_nll": float(val_nll.item()),
+                        })
+
+                        # Print bar chart
+                        console.print(f"  [cyan]slot_effect_norm (L1) top={top_l1}:[/]")
+                        console.print(f"[dim]{chart}[/]")
                     except Exception as e:
                         console.print(f"  [red]slot_effect_norm error: {e}[/]")
 
@@ -685,6 +714,7 @@ def train(args):
                     "optimizer": optimizer.state_dict(),
                     "meta": meta,
                     "grad_norms_per_slot": grad_norms_per_slot,
+                    "slot_effect_history": slot_effect_history,
                 }, out_dir / f"ckpt_{step}.pt")
                 console.print(f"[dim]Saved ckpt_{step}.pt[/]")
 
@@ -702,6 +732,7 @@ def train(args):
         "train_losses": train_losses,
         "val_nlls": val_nlls,
         "grad_norms_per_slot": grad_norms_per_slot,
+        "slot_effect_history": slot_effect_history,
         "meta": meta,
     }, out_dir / "final.pt")
 
@@ -771,6 +802,7 @@ def train(args):
         "attn_entropy": attn_entropy,
         "off_diag_similarity": off_diag,
         "grad_norms_per_slot": grad_norms_per_slot,
+        "slot_effect_history": slot_effect_history,
     }
     torch.save(diag, out_dir / "memory_diagnostics.pt")
     console.print(f"\n[green]Saved memory_diagnostics.pt[/]")
