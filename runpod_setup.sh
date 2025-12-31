@@ -34,21 +34,22 @@ python eval_mdn.py \
     --rollout 100 \
     --n-rollouts 16
 
-# 5. Train Memory Bank v1 (OPTIMIZED: slot-ID + AMP + torch.compile)
-echo "Training Memory Bank v1 (with slot-ID embeddings)..."
+# 5. Train Memory Bank v2 (FULL: slot-ID + aux loss + AMP + compile)
+echo "Training Memory Bank v2 (slot-ID + aux loss)..."
 python train_mdn_memory.py \
     --data-dir data/continuous_2M \
-    --out-dir out/mdn_memory_v1 \
+    --out-dir out/mdn_memory_v2 \
     --max-steps 10000 \
     --batch-size 1024 \
     --use-slot-id \
+    --aux-loss-weight 0.1 \
     --use-amp \
     --compile
 
 # 6. Run memory diagnostics
 echo "Running memory diagnostics..."
 python diagnose_memory.py \
-    --ckpt out/mdn_memory_v1/best.pt \
+    --ckpt out/mdn_memory_v2/best.pt \
     --data-dir data/continuous_2M \
     --output-dir reports/2M
 

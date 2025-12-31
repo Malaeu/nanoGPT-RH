@@ -134,6 +134,83 @@ class MemoryBank(nn.Module):
 
 
 # ============================================================================
+# WINDOW STATISTICS (for aux loss)
+# ============================================================================
+
+def compute_window_stats(x):
+    """
+    Compute global statistics of a window of spacings.
+
+    Args:
+        x: (B, T) spacing values
+
+    Returns:
+        stats: (B, 4) [mean, std, autocorr_lag1, autocorr_lag5]
+    """
+    B, T = x.shape
+
+    # Mean and std
+    mean = x.mean(dim=1, keepdim=True)  # (B, 1)
+    std = x.std(dim=1, keepdim=True)    # (B, 1)
+
+    # Autocorrelation at lag 1
+    x_centered = x - mean
+    ac1_num = (x_centered[:, :-1] * x_centered[:, 1:]).sum(dim=1, keepdim=True)
+    ac1_den = (x_centered ** 2).sum(dim=1, keepdim=True) + 1e-8
+    ac1 = ac1_num / ac1_den  # (B, 1)
+
+    # Autocorrelation at lag 5
+    if T > 5:
+        ac5_num = (x_centered[:, :-5] * x_centered[:, 5:]).sum(dim=1, keepdim=True)
+        ac5 = ac5_num / ac1_den
+    else:
+        ac5 = torch.zeros_like(ac1)
+
+    return torch.cat([mean, std, ac1, ac5], dim=1)  # (B, 4)
+
+
+class MemoryAuxHead(nn.Module):
+    """
+    Auxiliary head that makes memory slots predict window statistics.
+
+    Each slot is trained to predict a specific statistic:
+    - Slot 0 → mean
+    - Slot 1 → std
+    - Slot 2 → autocorr_lag1
+    - Slot 3 → autocorr_lag5
+
+    This gives memory slots semantic meaning and forces them to be useful.
+    """
+
+    def __init__(self, n_embd: int, n_stats: int = 4):
+        super().__init__()
+        self.n_stats = n_stats
+
+        # Each stat has its own head (slot i → stat i)
+        self.heads = nn.ModuleList([
+            nn.Linear(n_embd, 1) for _ in range(n_stats)
+        ])
+
+    def forward(self, memory_outputs):
+        """
+        Args:
+            memory_outputs: (B, M, D) - processed memory slot embeddings
+
+        Returns:
+            predicted_stats: (B, n_stats)
+        """
+        preds = []
+        for i, head in enumerate(self.heads):
+            if i < memory_outputs.size(1):
+                preds.append(head(memory_outputs[:, i, :]))  # (B, 1)
+            else:
+                # If fewer slots than stats, use last slot
+                preds.append(head(memory_outputs[:, -1, :]))
+
+        return torch.cat(preds, dim=1)  # (B, n_stats)
+
+
+# ============================================================================
 # SPACING MDN WITH MEMORY
 # ============================================================================
 
@@ -145,16 +222,23 @@ class SpacingMDNMemory(nn.Module):
     This allows the model to learn global context across the entire sequence.
 
     V1: Added use_slot_id to break permutation invariance.
+    V2: Added use_aux_loss to make memory predict window statistics.
     """
 
-    def __init__(self, config: MDNConfig, n_memory_slots: int = 8, use_slot_id: bool = True):
+    def __init__(self, config: MDNConfig, n_memory_slots: int = 8,
+                 use_slot_id: bool = True, use_aux_loss: bool = False):
         super().__init__()
         self.config = config
         self.n_memory_slots = n_memory_slots
         self.use_slot_id = use_slot_id
+        self.use_aux_loss = use_aux_loss
 
         # Memory bank (with optional slot-ID embeddings)
         self.memory_bank = MemoryBank(n_memory_slots, config.n_embd, use_slot_id=use_slot_id)
+
+        # Auxiliary head for window statistics prediction
+        if use_aux_loss:
+            self.aux_head = MemoryAuxHead(config.n_embd, n_stats=4)
 
         # Continuous input projection
         self.input_proj = nn.Linear(1, config.n_embd)
@@ -234,15 +318,23 @@ class SpacingMDNMemory(nn.Module):
 
         x = self.ln_f(x)
 
+        # Extract memory outputs (before removing them)
+        memory_outputs = x[:, :M, :]  # (B, M, D)
+
         # Remove memory positions for output (we only predict input positions)
         x = x[:, M:, :]  # (B, T, D)
 
         # MDN head
         pi, mu, sigma = self.mdn_head(x)
 
+        # Auxiliary predictions from memory
+        aux_preds = None
+        if self.use_aux_loss:
+            aux_preds = self.aux_head(memory_outputs)  # (B, n_stats)
+
         if return_attention:
-            return pi, mu, sigma, attentions
-        return pi, mu, sigma
+            return pi, mu, sigma, attentions, aux_preds
+        return pi, mu, sigma, aux_preds
 
     def get_memory_param_groups(self, base_lr, memory_lr_mult=0.3):
         """
@@ -297,13 +389,17 @@ def train(args):
     )
 
     # Model with memory
+    use_aux = args.aux_loss_weight > 0
     model = SpacingMDNMemory(
         config,
         n_memory_slots=args.n_memory_slots,
-        use_slot_id=args.use_slot_id
+        use_slot_id=args.use_slot_id,
+        use_aux_loss=use_aux
     ).to(device)
     if args.use_slot_id:
         console.print("[cyan]  Slot-ID embeddings: ENABLED (breaks permutation invariance)[/]")
+    if use_aux:
+        console.print(f"[cyan]  Aux loss: ENABLED (weight={args.aux_loss_weight})[/]")
 
     # torch.compile for faster training (PyTorch 2.0+)
     if args.compile and device.type == "cuda":
@@ -370,8 +466,15 @@ def train(args):
 
             # AMP autocast
             with torch.amp.autocast('cuda', enabled=scaler is not None):
-                pi, mu, sigma = model(x, collect_memory_stats=collect_stats)
+                pi, mu, sigma, aux_preds = model(x, collect_memory_stats=collect_stats)
                 loss, nll, entropy = mdn_loss(pi, mu, sigma, y, args.entropy_reg)
+
+                # Auxiliary loss: memory predicts window statistics
+                if args.aux_loss_weight > 0 and aux_preds is not None:
+                    # Compute window stats from FULL sequence (before splitting)
+                    window_stats = compute_window_stats(batch)  # (B, 4)
+                    aux_loss = F.mse_loss(aux_preds, window_stats)
+                    loss = loss + args.aux_loss_weight * aux_loss
 
             # Backward
             optimizer.zero_grad()
@@ -410,7 +513,7 @@ def train(args):
                     val_x = val_batch[:, :-1]
                     val_y = val_batch[:, 1:]
 
-                    val_pi, val_mu, val_sigma = model(val_x)
+                    val_pi, val_mu, val_sigma, _ = model(val_x)
                     val_loss, val_nll, val_entropy = mdn_loss(val_pi, val_mu, val_sigma, val_y, args.entropy_reg)
 
                 val_nlls.append(val_nll.item())
@@ -436,6 +539,8 @@ def train(args):
                         "config": config.__dict__,
                         "n_memory_slots": args.n_memory_slots,
                         "use_slot_id": args.use_slot_id,
+                        "use_aux_loss": use_aux,
+                        "aux_loss_weight": args.aux_loss_weight,
                         "step": step,
                         "val_nll": val_nll.item(),
                         "meta": meta,
@@ -448,6 +553,8 @@ def train(args):
                     "config": config.__dict__,
                     "n_memory_slots": args.n_memory_slots,
                     "use_slot_id": args.use_slot_id,
+                        "use_aux_loss": use_aux,
+                        "aux_loss_weight": args.aux_loss_weight,
                     "step": step,
                     "optimizer": optimizer.state_dict(),
                     "meta": meta,
@@ -463,6 +570,8 @@ def train(args):
         "config": config.__dict__,
         "n_memory_slots": args.n_memory_slots,
         "use_slot_id": args.use_slot_id,
+                        "use_aux_loss": use_aux,
+                        "aux_loss_weight": args.aux_loss_weight,
         "step": args.max_steps,
         "train_losses": train_losses,
         "val_nlls": val_nlls,
@@ -551,6 +660,8 @@ def main():
                         help="Add slot-ID embeddings (breaks permutation invariance)")
     parser.add_argument("--no-slot-id", dest="use_slot_id", action="store_false",
                         help="Disable slot-ID embeddings (v0 behavior)")
+    parser.add_argument("--aux-loss-weight", type=float, default=0.0,
+                        help="Weight for aux loss (0=disabled, 0.1=recommended)")
 
     # Training
     parser.add_argument("--batch-size", type=int, default=512)
