@@ -132,48 +132,53 @@ def compute_nll(model, data, device, n_samples=None):
     return total_nll / n_batches
 
 
-def compute_crps(model, data, device, n_samples=2000, n_mc_samples=100):
+def compute_crps(model, data, device, n_samples=2000, n_mc_samples=100, batch_size=64):
     """
     Compute CRPS (Continuous Ranked Probability Score) via sampling.
 
     CRPS = E[|s_sampled - s_true|] - 0.5 * E[|s_sampled - s_sampled'|]
+
+    FIXED: Uses batching to avoid OOM.
     """
     model.eval()
 
     # Sample subset of data
     idx = torch.randint(0, len(data), (n_samples,))
-    subset = data[idx].to(device)
-    x = subset[:, :-1]
-    y = subset[:, 1:]  # (n_samples, T-1)
+    subset = data[idx]
 
-    crps_values = []
+    all_crps = []
 
     with torch.no_grad():
-        pi, mu, sigma = model(x)  # (n_samples, T-1, K)
+        for i in range(0, n_samples, batch_size):
+            batch = subset[i:i+batch_size].to(device)
+            x = batch[:, :-1]
+            y = batch[:, 1:]
 
-        # Flatten for easier sampling
-        B, T, K = pi.shape
-        pi_flat = pi.view(-1, K)
-        mu_flat = mu.view(-1, K)
-        sigma_flat = sigma.view(-1, K)
-        y_flat = y.reshape(-1)
+            pi, mu, sigma = model(x)
 
-        # Sample from MDN
-        samples = sample_from_mdn(pi_flat, mu_flat, sigma_flat, n_mc_samples)  # (B*T, n_mc)
+            # Flatten for easier sampling
+            B, T, K = pi.shape
+            pi_flat = pi.view(-1, K)
+            mu_flat = mu.view(-1, K)
+            sigma_flat = sigma.view(-1, K)
+            y_flat = y.reshape(-1)
 
-        # Term 1: E[|s - y|]
-        term1 = torch.abs(samples - y_flat.unsqueeze(1)).mean(dim=1)
+            # Sample from MDN
+            samples = sample_from_mdn(pi_flat, mu_flat, sigma_flat, n_mc_samples)
 
-        # Term 2: E[|s - s'|] / 2
-        # Use pairwise differences
-        term2 = torch.abs(samples.unsqueeze(1) - samples.unsqueeze(2)).mean(dim=(1, 2)) / 2
+            # Term 1: E[|s - y|]
+            term1 = torch.abs(samples - y_flat.unsqueeze(1)).mean(dim=1)
 
-        crps = (term1 - term2).mean().item()
+            # Term 2: E[|s - s'|] / 2
+            term2 = torch.abs(samples.unsqueeze(1) - samples.unsqueeze(2)).mean(dim=(1, 2)) / 2
 
-    return crps
+            batch_crps = (term1 - term2).mean().item()
+            all_crps.append(batch_crps)
+
+    return np.mean(all_crps)
 
 
-def compute_pit(model, data, device, n_samples=20000):
+def compute_pit(model, data, device, n_samples=2000, batch_size=64):
     """
     Compute PIT (Probability Integral Transform) values.
 
@@ -181,20 +186,28 @@ def compute_pit(model, data, device, n_samples=20000):
 
     For well-calibrated model, PIT should be uniform [0, 1].
     Returns: pit_values, pit_mean, pit_std, ks_pvalue
+
+    FIXED: Uses batching to avoid OOM on large n_samples.
     """
     model.eval()
 
     idx = torch.randint(0, len(data), (n_samples,))
-    subset = data[idx].to(device)
-    x = subset[:, :-1]
-    y = subset[:, 1:]
+    subset = data[idx]
+
+    # Collect PIT values in batches to avoid OOM
+    all_pit = []
 
     with torch.no_grad():
-        pi, mu, sigma = model(x)
+        for i in range(0, n_samples, batch_size):
+            batch = subset[i:i+batch_size].to(device)
+            x = batch[:, :-1]
+            y = batch[:, 1:]
 
-        # Compute CDF at true values
-        pit = mdn_cdf(y, pi, mu, sigma)  # (B, T)
-        pit_flat = pit.cpu().numpy().flatten()
+            pi, mu, sigma = model(x)
+            pit = mdn_cdf(y, pi, mu, sigma)  # (B, T)
+            all_pit.append(pit.cpu())
+
+    pit_flat = torch.cat(all_pit, dim=0).numpy().flatten()
 
     # Remove invalid values
     pit_flat = pit_flat[(pit_flat >= 0) & (pit_flat <= 1)]
@@ -209,27 +222,35 @@ def compute_pit(model, data, device, n_samples=20000):
     return pit_flat, pit_mean, pit_std, ks_pvalue
 
 
-def compute_bias(model, data, device, n_samples=5000):
+def compute_bias(model, data, device, n_samples=2000, batch_size=64):
     """
     Compute prediction bias: E[E[s|x] - s_true]
 
     Positive bias = model predicts too high
     Negative bias = model predicts too low
+
+    FIXED: Uses batching to avoid OOM.
     """
     model.eval()
 
     idx = torch.randint(0, len(data), (n_samples,))
-    subset = data[idx].to(device)
-    x = subset[:, :-1]
-    y = subset[:, 1:]
+    subset = data[idx]
+
+    all_bias = []
 
     with torch.no_grad():
-        pi, mu, sigma = model(x)
-        pred_mean = mdn_mean(pi, mu, sigma)  # (B, T)
+        for i in range(0, n_samples, batch_size):
+            batch = subset[i:i+batch_size].to(device)
+            x = batch[:, :-1]
+            y = batch[:, 1:]
 
-        bias = (pred_mean - y).mean().item()
+            pi, mu, sigma = model(x)
+            pred_mean = mdn_mean(pi, mu, sigma)
 
-    return bias
+            batch_bias = (pred_mean - y).mean().item()
+            all_bias.append(batch_bias)
+
+    return np.mean(all_bias)
 
 
 # ============================================================================
