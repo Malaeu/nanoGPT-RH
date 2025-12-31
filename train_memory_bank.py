@@ -34,6 +34,7 @@ class MemoryBankConfig:
     seq_len: int = 256
     dropout: float = 0.1
     n_memory_slots: int = 4  # Number of learnable memory banks
+    use_scale: bool = True   # Scale Injection to cure "calibration blindness"
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -102,6 +103,18 @@ class MemoryBankGPT(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.pos_emb = nn.Embedding(config.seq_len, config.n_embd)
 
+        # FiLM: Feature-wise Linear Modulation (cures "calibration blindness")
+        # Output 2*n_embd: gamma (scale) + beta (shift)
+        # x = x * (1 + gamma) + beta
+        if config.use_scale:
+            self.scale_ln = nn.LayerNorm(1)
+            self.scale_proj = nn.Sequential(
+                nn.Linear(1, config.n_embd * 4),   # Bigger capacity
+                nn.GELU(),                         # Better than Tanh for deep
+                nn.Linear(config.n_embd * 4, config.n_embd * 2),  # 2*D for gamma+beta
+                nn.Tanh(),                         # Bound outputs to prevent explosion
+            )
+
         # Memory Bank (BEFORE transformer layers)
         self.memory_bank = MemoryBank(config.n_memory_slots, config.n_embd)
 
@@ -137,13 +150,32 @@ class MemoryBankGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, return_hidden=False):
+    def forward(self, idx, targets=None, return_hidden=False, scale_val=None, loss_weight=None):
         B, T = idx.shape
 
         # Embeddings
         tok_emb = self.tok_emb(idx)
         pos_emb = self.pos_emb(torch.arange(T, device=idx.device))
         x = tok_emb + pos_emb
+
+        # === Damped FiLM: Feature-wise Linear Modulation ===
+        # Damped to prevent overcorrection (v3 inverted the bias!)
+        if self.config.use_scale and scale_val is not None:
+            if scale_val.dim() == 2:
+                scale_val = scale_val.unsqueeze(-1)  # (B,T,1)
+
+            # Log transform for better dynamic range (spacings vary 0.01 to 4+)
+            scale_val = torch.log1p(scale_val)  # log(1 + s), stable for small s
+
+            s = self.scale_ln(scale_val)        # (B,T,1)
+            style = self.scale_proj(s)          # (B,T, 2*D)
+
+            gamma, beta = style.chunk(2, dim=-1)  # Each (B,T,D)
+
+            # Damped FiLM: gentle nudge instead of sledgehammer
+            DAMP_G = 0.2  # Damping factor for gamma (scale)
+            DAMP_B = 0.2  # Damping factor for beta (shift)
+            x = x * (1.0 + DAMP_G * gamma) + DAMP_B * beta
 
         # Apply Memory Bank
         x, mem_attn = self.memory_bank(x)
@@ -162,7 +194,11 @@ class MemoryBankGPT(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                weight=loss_weight,  # Inverse frequency weighting for long-tail
+            )
 
         if return_hidden:
             return {
@@ -181,8 +217,8 @@ class MemoryBankGPT(nn.Module):
 
 
 def train():
-    console.print("[bold magenta]🧠 MEMORY BANK TRAINING[/]")
-    console.print("[dim]Teaching AI to discover prime rhythms...[/]\n")
+    console.print("[bold magenta]🧠 MEMORY BANK TRAINING V4 (Damped FiLM + Reweighting)[/]")
+    console.print("[dim]x = x*(1 + 0.2γ) + 0.2β + inverse freq loss weights[/]\n")
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     console.print(f"[cyan]Device: {device}[/]")
@@ -190,6 +226,19 @@ def train():
     # Load data
     train_data = torch.load('data/train.pt', weights_only=False)
     val_data = torch.load('data/val.pt', weights_only=False)
+
+    # Load bin_centers for scale injection
+    bin_centers = np.load('data/bin_centers.npy')
+    bin_centers_t = torch.tensor(bin_centers, dtype=torch.float32).to(device)
+    console.print(f"[green]Scale injection: loaded {len(bin_centers)} bin centers[/]")
+
+    # Compute inverse frequency weights for loss (long-tail vocab fix)
+    vocab_size = 256
+    token_freq = torch.bincount(train_data.flatten(), minlength=vocab_size).float()
+    token_weight = 1.0 / (token_freq + 1e-6)  # inverse frequency
+    token_weight = token_weight / token_weight.mean()  # normalize to mean=1
+    token_weight = token_weight.to(device)
+    console.print(f"[green]Loss reweighting: inverse freq, range [{token_weight.min():.2f}, {token_weight.max():.2f}][/]")
 
     # Create config
     config = MemoryBankConfig(
@@ -205,8 +254,18 @@ def train():
     console.print(f"[green]Memory slots: {config.n_memory_slots}[/]")
     console.print(f"[green]Embedding dim: {config.n_embd}[/]")
 
-    # Create model
+    # Create model and load v3 checkpoint for fine-tuning
     model = MemoryBankGPT(config).to(device)
+
+    # Fine-tune from v3 checkpoint (not from scratch!)
+    v3_ckpt_path = Path('out/memory_bank_v3_best.pt')
+    if v3_ckpt_path.exists():
+        v3_ckpt = torch.load(v3_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(v3_ckpt['model'])
+        console.print(f"[yellow]Fine-tuning from v3 checkpoint (val_loss={v3_ckpt['val_loss']:.4f})[/]")
+    else:
+        console.print("[red]WARNING: v3 checkpoint not found, training from scratch![/]")
+
     n_params = sum(p.numel() for p in model.parameters())
     console.print(f"[green]Parameters: {n_params:,}[/]\n")
 
@@ -217,12 +276,12 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=64)
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5000)
+    # Optimizer (lower LR for fine-tuning v4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
 
-    # Training loop
-    n_steps = 5000
+    # Training loop (10000 steps for damped FiLM + reweighting to converge)
+    n_steps = 10000
     step = 0
     best_val_loss = float('inf')
 
@@ -245,9 +304,10 @@ def train():
                 x, y = next(train_iter)
 
             x, y = x.to(device), y.to(device)
+            scale_val = bin_centers_t[x]  # (B, T) lookup real spacing values
 
             optimizer.zero_grad()
-            logits, loss, mem_attn = model(x, y)
+            logits, loss, mem_attn = model(x, y, scale_val=scale_val, loss_weight=token_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -263,7 +323,8 @@ def train():
                 with torch.no_grad():
                     for x, y in val_loader:
                         x, y = x.to(device), y.to(device)
-                        _, loss, _ = model(x, y)
+                        sv = bin_centers_t[x]  # scale_val for validation
+                        _, loss, _ = model(x, y, scale_val=sv)
                         val_losses.append(loss.item())
                 val_loss = np.mean(val_losses)
                 val_ppl = np.exp(val_loss)
@@ -273,9 +334,10 @@ def train():
                     torch.save({
                         'model': model.state_dict(),
                         'config': config,
+                        'bin_centers': bin_centers,  # save for inference
                         'step': step,
                         'val_loss': val_loss
-                    }, 'out/memory_bank_best.pt')
+                    }, 'out/memory_bank_v4_best.pt')
 
                 console.print(f"[dim]Step {step}: val_loss={val_loss:.4f}, val_ppl={val_ppl:.2f}[/]")
                 model.train()
@@ -284,9 +346,10 @@ def train():
     torch.save({
         'model': model.state_dict(),
         'config': config,
+        'bin_centers': bin_centers,  # save for inference
         'step': step,
         'val_loss': val_loss
-    }, 'out/memory_bank_final.pt')
+    }, 'out/memory_bank_v4_final.pt')
 
     console.print(f"\n[bold green]✅ Training complete![/]")
     console.print(f"[green]Best val loss: {best_val_loss:.4f}[/]")
@@ -299,9 +362,9 @@ def train():
         bar = "█" * int(w * 40)
         console.print(f"  Slot {i}: {bar} ({w:.3f})")
 
-    console.print(f"\n[cyan]Saved: out/memory_bank_final.pt[/]")
-    console.print(f"[cyan]Saved: out/memory_bank_best.pt[/]")
-    console.print("\n[yellow]Run probe_brain.py to analyze memory for hidden frequencies![/]")
+    console.print(f"\n[cyan]Saved: out/memory_bank_v4_final.pt[/]")
+    console.print(f"[cyan]Saved: out/memory_bank_v4_best.pt[/]")
+    console.print("\n[yellow]Run mine_residuals_v2.py to check if Damped FiLM + Reweighting killed Scale Blindness![/]")
 
 
 if __name__ == "__main__":

@@ -121,3 +121,84 @@ Cross-reference with Q3 formal structures:
 - 256 bins for spacing classification gives stable perplexity metric
 - RoPE / sinusoidal positional encoding justified for sequence + phase structure
 - Save hidden states during training for manifold analysis
+
+## RunPod GPU Training Guide
+
+### ОДНА КОМАНДА для полного pipeline
+
+**НА МАКЕ (подготовка):**
+```bash
+cd /Users/emalam/Documents/GitHub/nanoGpt_RH
+
+# Создать пакет
+tar czf runpod_package.tar.gz \
+  train_mdn.py eval_mdn.py train_mdn_memory.py diagnose_memory.py \
+  runpod_setup.sh data/continuous_2M
+
+# Отправить (получишь код типа: 2406-final-rufus-fashion-5)
+runpodctl send runpod_package.tar.gz
+```
+
+**НА ПОДЕ (одна команда!):**
+```bash
+cd /workspace && runpodctl receive <КОД> && tar xzf runpod_package.tar.gz && chmod +x runpod_setup.sh && ./runpod_setup.sh
+```
+
+**СКАЧАТЬ РЕЗУЛЬТАТЫ:**
+```bash
+# На поде:
+tar czf results.tar.gz out/ reports/ && runpodctl send results.tar.gz
+
+# На маке:
+runpodctl receive <КОД>
+tar xzf results.tar.gz
+```
+
+### Проблемы с Web Terminal / Jupyter
+
+**ИЗВЕСТНЫЙ БАГ RUNPOD!** Веб-терминал и Jupyter часто не работают:
+- После рестарта пода веб-терминал может не запуститься
+- Jupyter показывает 502 Bad Gateway
+- Терминал в Jupyter пустой/не печатает
+
+**РЕШЕНИЯ:**
+1. **Используй SSH вместо веб-терминала** (надежнее):
+   ```bash
+   # Proxy SSH (работает всегда, но без SCP):
+   ssh espzoobm5yxuif-64410f63@ssh.runpod.io -i ~/.ssh/id_ed25519
+
+   # Или Direct TCP (если настроен):
+   ssh -p <PORT> root@<IP> -i ~/.ssh/id_ed25519
+   ```
+
+2. **Перезапусти под** - иногда веб-терминал работает только при первом запуске
+
+3. **Проверь шаблон пода** - только официальные шаблоны RunPod поддерживают Jupyter
+
+4. **Подожди 2-3 минуты** после старта пода - иногда нужно время
+
+### Установка runpodctl (один раз)
+```bash
+brew install runpod/runpodctl/runpodctl
+```
+
+### SSH Access (опционально)
+Для Direct TCP SSH, добавь ключ НА ПОДЕ:
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo "ssh-ed25519 AAAA... твой_ключ" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+### Performance Tips
+- **H100 80GB**: batch_size 2048, --use-amp --compile
+- **A100 40GB**: batch_size 1024, --use-amp
+- FlashAttention включен по умолчанию в train_mdn.py
+
+### Что делает runpod_setup.sh
+1. pip install torch numpy scipy matplotlib rich
+2. Проверка GPU
+3. train_mdn.py (20k steps, ~50 мин на H100)
+4. eval_mdn.py (метрики)
+5. train_mdn_memory.py (10k steps, ~30 мин)
+6. diagnose_memory.py (диагностика)

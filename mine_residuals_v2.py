@@ -28,7 +28,7 @@ console = Console()
 
 
 def mine_residuals_v2(
-    ckpt_path="out/memory_bank_best.pt",
+    ckpt_path="out/memory_bank_v4_best.pt",  # v4 with Damped FiLM + Reweighting
     n_seq=256,
     quantile=0.95,
     which_hidden="pre",  # "pre" or "post" ln_f
@@ -64,13 +64,23 @@ def mine_residuals_v2(
     X = val[:, :-1].to(device)
     Y = val[:, 1:].to(device)
 
+    # Load bin_centers for scale injection (if v2 model)
+    bin_centers = ckpt.get("bin_centers", None)
+    if bin_centers is not None:
+        bin_centers_t = torch.tensor(bin_centers, dtype=torch.float32).to(device)
+        scale_val = bin_centers_t[X]  # (B, T) real spacing values
+        console.print(f"  Scale injection: enabled (v2 model)")
+    else:
+        scale_val = None
+        console.print(f"  Scale injection: disabled (v1 model)")
+
     console.print(f"  Sequences: {X.shape[0]}")
     console.print(f"  Seq length: {X.shape[1]}")
     console.print(f"  Total tokens: {X.shape[0] * X.shape[1]}")
 
     # Forward with hidden states
     console.print("\nForward pass with hidden states...")
-    out = model(X, targets=None, return_hidden=True)
+    out = model(X, targets=None, return_hidden=True, scale_val=scale_val)
     logits = out["logits"]  # (B, T, V)
 
     h = out["hidden_pre_ln"] if which_hidden == "pre" else out["hidden_post_ln"]
@@ -125,10 +135,17 @@ def mine_residuals_v2(
     t_pos = idx[:, 1].astype(np.float64)  # Position in window
     y_true = Y.detach()[hard_mask].cpu().numpy().astype(np.float64)
 
+    # Real spacing values (if bin_centers available)
+    if bin_centers is not None:
+        real_spacing = bin_centers[y_true.astype(int)]
+    else:
+        real_spacing = None
+
     # Correlations
     corr_t = np.corrcoef(H1, t_pos)[0, 1] if len(H1) > 1 else 0
     corr_y = np.corrcoef(H1, y_true)[0, 1] if len(H1) > 1 else 0
     corr_batch = np.corrcoef(H1, batch_idx)[0, 1] if len(H1) > 1 else 0
+    corr_real = np.corrcoef(H1, real_spacing)[0, 1] if real_spacing is not None and len(H1) > 1 else None
 
     # Results table
     console.print("\n")
@@ -161,6 +178,8 @@ def mine_residuals_v2(
 
     table.add_row("corr(H1, position)", f"{corr_t:.3f}", corr_verdict(corr_t))
     table.add_row("corr(H1, token-id)", f"{corr_y:.3f}", corr_verdict(corr_y))
+    if corr_real is not None:
+        table.add_row("corr(H1, real_spacing)", f"{corr_real:.3f}", corr_verdict(corr_real))
     table.add_row("corr(H1, batch)", f"{corr_batch:.3f}", corr_verdict(corr_batch))
 
     console.print(table)
