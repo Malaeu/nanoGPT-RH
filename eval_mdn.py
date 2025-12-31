@@ -436,7 +436,11 @@ def main():
 
     config = MDNConfig(**ckpt["config"])
     model = SpacingMDN(config).to(device)
-    model.load_state_dict(ckpt["model"])
+
+    # Handle torch.compile() checkpoint (strips _orig_mod. prefix)
+    state_dict = ckpt["model"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
 
     # Load data
@@ -487,7 +491,7 @@ def main():
     # ========================================================================
     console.print("\n[bold cyan]═══ Rollout Metrics ═══[/]")
 
-    horizons = [10, 25, 50, 100, 200]
+    horizons = [10, 25, 50, 100, 200, 500]
     horizons = [h for h in horizons if h <= args.rollout]
 
     rollout_results = compute_rollout_metrics(model, val_data, device, horizons, args.n_rollouts)
@@ -507,6 +511,18 @@ def main():
         )
 
     console.print(rollout_table)
+
+    # Compute drift/slope if we have enough horizons
+    if 100 in rollout_results and 500 in rollout_results:
+        err_100 = rollout_results[100]['err_median']
+        err_500 = rollout_results[500]['err_median']
+        slope = (err_500 - err_100) / 400
+        console.print(f"\n[cyan]Drift slope (Err@500-Err@100)/400: {slope:.6f}[/]")
+    elif 100 in rollout_results and 200 in rollout_results:
+        err_100 = rollout_results[100]['err_median']
+        err_200 = rollout_results[200]['err_median']
+        slope = (err_200 - err_100) / 100
+        console.print(f"\n[cyan]Drift slope (Err@200-Err@100)/100: {slope:.6f}[/]")
 
     # ========================================================================
     # SUMMARY TABLE

@@ -104,7 +104,7 @@ def ablation_study(model, data, device, n_eval=500):
     y = batch[:, 1:]
 
     with torch.no_grad():
-        pi, mu, sigma = model(x)
+        pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
         _, base_nll, _ = mdn_loss(pi, mu, sigma, y, 0.0)
         base_bias = (mdn_mean(pi, mu, sigma) - y).mean().item()
 
@@ -121,7 +121,7 @@ def ablation_study(model, data, device, n_eval=500):
         model.memory_bank.memory.data[slot_idx] = 0
 
         with torch.no_grad():
-            pi, mu, sigma = model(x)
+            pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
             _, abl_nll, _ = mdn_loss(pi, mu, sigma, y, 0.0)
             abl_bias = (mdn_mean(pi, mu, sigma) - y).mean().item()
 
@@ -186,7 +186,7 @@ def permutation_test(model, data, device, n_perms=5, n_eval=500):
 
     # Baseline
     with torch.no_grad():
-        pi, mu, sigma = model(x)
+        pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
         _, base_nll, _ = mdn_loss(pi, mu, sigma, y, 0.0)
     base_nll = base_nll.item()
 
@@ -199,7 +199,7 @@ def permutation_test(model, data, device, n_perms=5, n_eval=500):
         model.memory_bank.memory.data = original_memory[perm]
 
         with torch.no_grad():
-            pi, mu, sigma = model(x)
+            pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
             _, perm_nll, _ = mdn_loss(pi, mu, sigma, y, 0.0)
         perm_nlls.append(perm_nll.item())
 
@@ -336,7 +336,11 @@ def main():
         use_slot_id=use_slot_id,
         use_aux_loss=use_aux_loss
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+
+    # Handle torch.compile() checkpoint (strips _orig_mod. prefix)
+    state_dict = ckpt["model"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
 
     if use_slot_id:

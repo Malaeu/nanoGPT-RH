@@ -20,6 +20,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Enable TensorFloat32 for better H100/A100 performance (~10-15% speedup)
+torch.set_float32_matmul_precision('high')
+
 from pathlib import Path
 from dataclasses import dataclass
 from rich.console import Console
