@@ -488,6 +488,35 @@ def rollout_drift_loss(
     return loss
 
 
+@torch.no_grad()
+def rollout_err(model, x, start: int = 10, H: int = 10):
+    """
+    Measure rollout error @H steps (for logging, not training).
+
+    Returns MAE between predicted and ground truth spacings over H steps.
+    """
+    model.eval()
+    B, T = x.shape
+    device = x.device
+
+    if start + H > T:
+        return float('nan')
+
+    gt = x[:, start:start+H]  # (B, H)
+    ctx = x[:, :start].clone()
+
+    preds = []
+    for _ in range(H):
+        pi, mu, sigma, _ = model(ctx)
+        s_next = (pi[:, -1, :] * mu[:, -1, :]).sum(dim=-1, keepdim=True)
+        preds.append(s_next)
+        ctx = torch.cat([ctx, s_next], dim=1)
+
+    pred = torch.cat(preds, dim=1)  # (B, H)
+    err = (pred - gt).abs().mean().item()
+    return err
+
+
 # ============================================================================
 # TRAINING
 # ============================================================================
@@ -750,12 +779,27 @@ def train(args):
                     f"ETA: {eta_sec/60:.1f}m"
                 )
 
-                # --- SLOT EFFECT NORM (real importance, every 1000 steps) ---
+                # --- EXTENDED METRICS (every 1000 steps) ---
                 if step % 1000 == 0:
                     try:
-                        xb = val_data[:8].to(device)  # small probe batch
-                        eff_l1, eff_l2 = slot_effect_norm(model, xb, n_slots=args.n_memory_slots)
+                        xb = val_data[:16].to(device)  # probe batch
+                        x_input = xb[:, :-1]
+                        y_target = xb[:, 1:]
+
+                        # 1. Baseline MAE (model prediction vs ground truth)
+                        with torch.no_grad():
+                            pi_b, mu_b, _, _ = model(x_input)
+                            pred_mean = (pi_b * mu_b).sum(dim=-1)
+                            baseline_mae = (pred_mean - y_target).abs().mean().item()
+
+                        # 2. Rollout error @10
+                        err_at_10 = rollout_err(model, xb, start=10, H=10)
+
+                        # 3. Slot effect norm
+                        eff_l1, eff_l2 = slot_effect_norm(model, x_input, n_slots=args.n_memory_slots)
                         top_l1, chart = format_slot_effects(eff_l1)
+                        max_eff = max(eff_l1) if eff_l1 else 0.0
+                        effect_pct = (max_eff / baseline_mae * 100) if baseline_mae > 0 else 0.0
 
                         # Log to history
                         slot_effect_history.append({
@@ -763,15 +807,24 @@ def train(args):
                             "effects_l1": eff_l1,
                             "effects_l2": eff_l2,
                             "top_slot": top_l1,
-                            "top_value": max(eff_l1) if eff_l1 else 0.0,
+                            "top_value": max_eff,
                             "val_nll": float(val_nll.item()),
+                            "baseline_mae": baseline_mae,
+                            "err_at_10": err_at_10,
+                            "effect_pct": effect_pct,
                         })
 
+                        # Print extended metrics line
+                        console.print(
+                            f"  [yellow]→ Err@10={err_at_10:.4f} | "
+                            f"MAE={baseline_mae:.4f} | "
+                            f"eff%={effect_pct:.1f}%[/]"
+                        )
                         # Print bar chart
                         console.print(f"  [cyan]slot_effect_norm (L1) top={top_l1}:[/]")
                         console.print(f"[dim]{chart}[/]")
                     except Exception as e:
-                        console.print(f"  [red]slot_effect_norm error: {e}[/]")
+                        console.print(f"  [red]extended metrics error: {e}[/]")
 
                 # Save best
                 if val_nll.item() < best_val_nll:
