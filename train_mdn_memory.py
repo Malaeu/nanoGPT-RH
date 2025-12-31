@@ -434,16 +434,51 @@ def train(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resume from checkpoint if specified
+    start_step = 1
+    best_val_nll = float('inf')
+    train_losses = []
+    val_nlls = []
+
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        if ckpt_path.exists():
+            console.print(f"\n[bold yellow]═══ RESUMING from {ckpt_path} ═══[/]")
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+            # Load model state
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+            base_model.load_state_dict(state_dict)
+
+            # Load optimizer state if available
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                console.print("[green]  ✓ Optimizer state loaded[/]")
+
+            # Get start step
+            start_step = ckpt.get("step", 0) + 1
+            console.print(f"[green]  ✓ Resuming from step {start_step}[/]")
+
+            # Load best val_nll if available
+            if "val_nll" in ckpt:
+                best_val_nll = ckpt["val_nll"]
+                console.print(f"[green]  ✓ Best val_nll: {best_val_nll:.4f}[/]")
+
+            # Advance scheduler to correct step
+            for _ in range(start_step - 1):
+                scheduler.step()
+            console.print(f"[green]  ✓ Scheduler advanced to step {start_step}[/]\n")
+        else:
+            console.print(f"[red]WARNING: Checkpoint {ckpt_path} not found, starting fresh[/]")
+
     # Training loop
     console.print(f"\n[cyan]Training config:[/]")
     console.print(f"  max_steps={args.max_steps}")
     console.print(f"  batch_size={args.batch_size}")
     console.print(f"  lr={args.lr}, memory_lr={args.lr * args.memory_lr_mult}")
     console.print(f"  n_memory_slots={args.n_memory_slots}")
-
-    best_val_nll = float('inf')
-    train_losses = []
-    val_nlls = []
+    if args.resume:
+        console.print(f"  [yellow]resume_from={args.resume} (step {start_step})[/]")
 
     # For memory diagnostics
     grad_norms_per_slot = []
@@ -454,14 +489,14 @@ def train(args):
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
     ) as progress:
-        task = progress.add_task("Training MDN+Memory...", total=args.max_steps)
+        task = progress.add_task("Training MDN+Memory...", total=args.max_steps, completed=start_step - 1)
 
         # Timing
         train_start_time = time.time()
         last_log_time = train_start_time
-        last_log_step = 0
+        last_log_step = start_step - 1  # For correct delta calculation on resume
 
-        for step in range(1, args.max_steps + 1):
+        for step in range(start_step, args.max_steps + 1):
             model.train()
 
             # Sample batch
@@ -728,6 +763,10 @@ def main():
     # Performance
     parser.add_argument("--use-amp", action="store_true", help="Use AMP for 2x memory savings")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile() for 1.5-2x speedup")
+
+    # Resume from checkpoint
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Path to checkpoint to resume from (e.g., out/mdn_memory_v1/ckpt_5000.pt)")
 
     args = parser.parse_args()
     train(args)

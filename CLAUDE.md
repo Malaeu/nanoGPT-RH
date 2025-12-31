@@ -202,3 +202,32 @@ chmod 600 ~/.ssh/authorized_keys
 4. eval_mdn.py (метрики)
 5. train_mdn_memory.py (10k steps, ~30 мин)
 6. diagnose_memory.py (диагностика)
+
+## GPU Benchmark (2024-12-31)
+
+### Speed Comparison (SpacingMDN+Memory, 4.8M params)
+
+| GPU | $/hr | steps/s | batch | Δ per 500 steps | samples/s |
+|-----|------|---------|-------|-----------------|-----------|
+| Mac M4 Max | FREE | 1.3 | 128 | ~3.2m | 166 |
+| A40 48GB | $0.40 | 5.8 | 512 | ~1.4m | 2,969 |
+| H100 80GB | $3.69 | ~15* | 512 | ~33s* | ~7,680* |
+
+*H100 estimated based on typical 2.5x speedup over A40
+
+### Cost Analysis (20k steps)
+
+| GPU | Time | Cost | Cost/10k steps |
+|-----|------|------|----------------|
+| Mac M4 Max | ~4.3 hr | $0 | $0 |
+| A40 | ~57 min | ~$0.38 | $0.19 |
+| H100 | ~22 min | ~$1.35 | $0.68 |
+
+### Recommendation
+
+**A40 = лучший выбор по цена/производительность для наших моделей!**
+- 18x быстрее Mac по samples/sec
+- 3.5x дешевле H100 при 2.5x меньшей скорости
+- 48GB VRAM достаточно для batch_size=512
+
+Для маленьких моделей (<10M params) H100 избыточна.
