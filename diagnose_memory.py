@@ -327,10 +327,14 @@ def main():
 
     config = MDNConfig(**ckpt["config"])
     n_slots = ckpt.get("n_memory_slots", 8)
+    use_slot_id = ckpt.get("use_slot_id", False)  # Default False for v0 compat
 
-    model = SpacingMDNMemory(config, n_memory_slots=n_slots).to(device)
+    model = SpacingMDNMemory(config, n_memory_slots=n_slots, use_slot_id=use_slot_id).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
+
+    if use_slot_id:
+        console.print("[cyan]  Slot-ID embeddings: ENABLED[/]")
 
     # Load data
     data_dir = Path(args.data_dir)

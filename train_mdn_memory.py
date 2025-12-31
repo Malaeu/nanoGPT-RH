@@ -47,19 +47,29 @@ class MemoryBank(nn.Module):
     These tokens are prepended to the input sequence and attend to/from
     all other tokens. They capture global patterns and long-range dependencies.
 
+    V1: Added slot-ID embeddings to break permutation invariance.
+    Each slot gets a unique, learnable identity embedding.
+
     Instrumented to track:
     - Attention patterns to memory slots
     - Gradient norms per slot
     - Slot embeddings for similarity analysis
     """
 
-    def __init__(self, n_slots: int, n_embd: int):
+    def __init__(self, n_slots: int, n_embd: int, use_slot_id: bool = True):
         super().__init__()
         self.n_slots = n_slots
         self.n_embd = n_embd
+        self.use_slot_id = use_slot_id
 
-        # Learnable memory embeddings
+        # Learnable memory embeddings (content)
         self.memory = nn.Parameter(torch.randn(n_slots, n_embd) * 0.02)
+
+        # Slot-ID embeddings: fixed identity for each slot (breaks permutation invariance)
+        if use_slot_id:
+            self.slot_id = nn.Embedding(n_slots, n_embd)
+            # Initialize slot IDs to be orthogonal-ish
+            nn.init.orthogonal_(self.slot_id.weight)
 
         # Track attention received by each slot (for diagnostics)
         self.register_buffer('attn_mass', torch.zeros(n_slots))
@@ -67,7 +77,14 @@ class MemoryBank(nn.Module):
 
     def forward(self, batch_size: int, device: torch.device):
         """Return memory tokens expanded for batch."""
-        return self.memory.unsqueeze(0).expand(batch_size, -1, -1)  # (B, M, D)
+        memory = self.memory  # (M, D)
+
+        # Add slot-ID embedding to break permutation invariance
+        if self.use_slot_id:
+            slot_ids = torch.arange(self.n_slots, device=device)
+            memory = memory + self.slot_id(slot_ids)  # (M, D) + (M, D)
+
+        return memory.unsqueeze(0).expand(batch_size, -1, -1)  # (B, M, D)
 
     def update_attn_stats(self, attn_weights):
         """
@@ -102,8 +119,15 @@ class MemoryBank(nn.Module):
 
     def get_slot_similarity(self):
         """Compute cosine similarity matrix between memory slots."""
+        # Use full embeddings (memory + slot_id if enabled)
+        if self.use_slot_id:
+            slot_ids = torch.arange(self.n_slots, device=self.memory.device)
+            embeddings = self.memory + self.slot_id(slot_ids)
+        else:
+            embeddings = self.memory
+
         # Normalize embeddings
-        normed = F.normalize(self.memory, dim=-1)  # (M, D)
+        normed = F.normalize(embeddings, dim=-1)  # (M, D)
         # Cosine similarity
         sim = torch.mm(normed, normed.t())  # (M, M)
         return sim.detach()
@@ -119,15 +143,18 @@ class SpacingMDNMemory(nn.Module):
 
     Memory tokens are prepended to the sequence and participate in attention.
     This allows the model to learn global context across the entire sequence.
+
+    V1: Added use_slot_id to break permutation invariance.
     """
 
-    def __init__(self, config: MDNConfig, n_memory_slots: int = 8):
+    def __init__(self, config: MDNConfig, n_memory_slots: int = 8, use_slot_id: bool = True):
         super().__init__()
         self.config = config
         self.n_memory_slots = n_memory_slots
+        self.use_slot_id = use_slot_id
 
-        # Memory bank
-        self.memory_bank = MemoryBank(n_memory_slots, config.n_embd)
+        # Memory bank (with optional slot-ID embeddings)
+        self.memory_bank = MemoryBank(n_memory_slots, config.n_embd, use_slot_id=use_slot_id)
 
         # Continuous input projection
         self.input_proj = nn.Linear(1, config.n_embd)
@@ -270,7 +297,13 @@ def train(args):
     )
 
     # Model with memory
-    model = SpacingMDNMemory(config, n_memory_slots=args.n_memory_slots).to(device)
+    model = SpacingMDNMemory(
+        config,
+        n_memory_slots=args.n_memory_slots,
+        use_slot_id=args.use_slot_id
+    ).to(device)
+    if args.use_slot_id:
+        console.print("[cyan]  Slot-ID embeddings: ENABLED (breaks permutation invariance)[/]")
 
     # torch.compile for faster training (PyTorch 2.0+)
     if args.compile and device.type == "cuda":
@@ -402,6 +435,7 @@ def train(args):
                         "model": model.state_dict(),
                         "config": config.__dict__,
                         "n_memory_slots": args.n_memory_slots,
+                        "use_slot_id": args.use_slot_id,
                         "step": step,
                         "val_nll": val_nll.item(),
                         "meta": meta,
@@ -413,6 +447,7 @@ def train(args):
                     "model": model.state_dict(),
                     "config": config.__dict__,
                     "n_memory_slots": args.n_memory_slots,
+                    "use_slot_id": args.use_slot_id,
                     "step": step,
                     "optimizer": optimizer.state_dict(),
                     "meta": meta,
@@ -427,6 +462,7 @@ def train(args):
         "model": model.state_dict(),
         "config": config.__dict__,
         "n_memory_slots": args.n_memory_slots,
+        "use_slot_id": args.use_slot_id,
         "step": args.max_steps,
         "train_losses": train_losses,
         "val_nlls": val_nlls,
@@ -511,6 +547,10 @@ def main():
     # Memory
     parser.add_argument("--n-memory-slots", type=int, default=8)
     parser.add_argument("--memory-lr-mult", type=float, default=0.3)
+    parser.add_argument("--use-slot-id", action="store_true", default=True,
+                        help="Add slot-ID embeddings (breaks permutation invariance)")
+    parser.add_argument("--no-slot-id", dest="use_slot_id", action="store_false",
+                        help="Disable slot-ID embeddings (v0 behavior)")
 
     # Training
     parser.add_argument("--batch-size", type=int, default=512)
@@ -524,7 +564,7 @@ def main():
     # Checkpointing
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--save-interval", type=int, default=5000)
-    parser.add_argument("--out-dir", type=str, default="out/mdn_memory_v0")
+    parser.add_argument("--out-dir", type=str, default="out/mdn_memory_v1")
 
     # Performance
     parser.add_argument("--use-amp", action="store_true", help="Use AMP for 2x memory savings")
