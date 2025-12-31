@@ -35,8 +35,9 @@ import argparse
 
 console = Console()
 
-# Import model
+# Import models
 from train_mdn import SpacingMDN, MDNConfig
+from train_mdn_memory import SpacingMDNMemory
 
 
 # ============================================================================
@@ -117,7 +118,7 @@ def compute_nll(model, data, device, n_samples=None):
         y = batch[:, 1:]
 
         with torch.no_grad():
-            pi, mu, sigma = model(x)
+            pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
 
             # NLL
             y_exp = y.unsqueeze(-1)
@@ -154,7 +155,7 @@ def compute_crps(model, data, device, n_samples=2000, n_mc_samples=100, batch_si
             x = batch[:, :-1]
             y = batch[:, 1:]
 
-            pi, mu, sigma = model(x)
+            pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
 
             # Flatten for easier sampling
             B, T, K = pi.shape
@@ -203,7 +204,7 @@ def compute_pit(model, data, device, n_samples=2000, batch_size=64):
             x = batch[:, :-1]
             y = batch[:, 1:]
 
-            pi, mu, sigma = model(x)
+            pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
             pit = mdn_cdf(y, pi, mu, sigma)  # (B, T)
             all_pit.append(pit.cpu())
 
@@ -244,7 +245,7 @@ def compute_bias(model, data, device, n_samples=2000, batch_size=64):
             x = batch[:, :-1]
             y = batch[:, 1:]
 
-            pi, mu, sigma = model(x)
+            pi, mu, sigma, *_ = model(x)  # Ignore aux outputs if present
             pred_mean = mdn_mean(pi, mu, sigma)
 
             batch_bias = (pred_mean - y).mean().item()
@@ -282,7 +283,7 @@ def rollout_mean(model, start_seq, horizon, device):
             if current.shape[1] > seq_len:
                 current = current[:, -seq_len:]
 
-            pi, mu, sigma = model(current)
+            pi, mu, sigma, *_ = model(current)  # Ignore aux outputs if present
 
             # Get mean of last position
             pred = mdn_mean(pi[:, -1], mu[:, -1], sigma[:, -1])  # (B,)
@@ -320,7 +321,7 @@ def rollout_sample(model, start_seq, horizon, device, n_ensemble=64):
             if current.shape[1] > seq_len:
                 current = current[:, -seq_len:]
 
-            pi, mu, sigma = model(current)
+            pi, mu, sigma, *_ = model(current)  # Ignore aux outputs if present
 
             # Sample from last position
             pred = sample_from_mdn(pi[:, -1], mu[:, -1], sigma[:, -1], 1).squeeze(-1)  # (B*n_ens,)
@@ -417,6 +418,7 @@ def main():
     parser.add_argument("--rollout", type=int, default=100, help="Max rollout horizon")
     parser.add_argument("--n-rollouts", type=int, default=32, help="Rollout ensemble size")
     parser.add_argument("--output-dir", type=str, default="reports/2M", help="Output directory")
+    parser.add_argument("--memory", action="store_true", help="Load Memory model instead of baseline")
     args = parser.parse_args()
 
     console.print("[bold magenta]═══ TASK_SPEC_2M: Eval Suite ═══[/]\n")
@@ -435,11 +437,30 @@ def main():
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
 
     config = MDNConfig(**ckpt["config"])
-    model = SpacingMDN(config).to(device)
 
     # Handle torch.compile() checkpoint (strips _orig_mod. prefix)
     state_dict = ckpt["model"]
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+    # Auto-detect Memory model by checking for memory_bank keys
+    is_memory_model = args.memory or any("memory_bank" in k for k in state_dict.keys())
+
+    if is_memory_model:
+        n_slots = ckpt.get("n_memory_slots", 8)
+        use_slot_id = ckpt.get("use_slot_id", False)
+        use_aux_loss = ckpt.get("use_aux_loss", False)
+        model = SpacingMDNMemory(
+            config,
+            n_memory_slots=n_slots,
+            use_slot_id=use_slot_id,
+            use_aux_loss=use_aux_loss
+        ).to(device)
+        console.print(f"[cyan]SpacingMDN+Memory: {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters[/]")
+        console.print(f"[cyan]  Memory slots: {n_slots}, slot-ID: {use_slot_id}, aux_loss: {use_aux_loss}[/]")
+    else:
+        model = SpacingMDN(config).to(device)
+        console.print(f"[cyan]SpacingMDN: {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters[/]")
+
     model.load_state_dict(state_dict)
     model.eval()
 

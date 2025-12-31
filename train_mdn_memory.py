@@ -17,6 +17,7 @@ Architecture:
 """
 
 import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -455,6 +456,11 @@ def train(args):
     ) as progress:
         task = progress.add_task("Training MDN+Memory...", total=args.max_steps)
 
+        # Timing
+        train_start_time = time.time()
+        last_log_time = train_start_time
+        last_log_step = 0
+
         for step in range(1, args.max_steps + 1):
             model.train()
 
@@ -527,12 +533,39 @@ def train(args):
                 attn_entropy = -(attn_dist * torch.log(attn_dist + 1e-10)).sum().item()
                 max_attn_slot = attn_dist.argmax().item()
 
+                # Timing stats
+                now = time.time()
+                elapsed_total = now - train_start_time
+                elapsed_interval = now - last_log_time
+                steps_interval = step - last_log_step
+                steps_per_sec = steps_interval / elapsed_interval if elapsed_interval > 0 else 0
+                remaining_steps = args.max_steps - step
+                eta_sec = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
+
+                # Format time nicely
+                if elapsed_total < 60:
+                    time_str = f"{elapsed_total:.0f}s"
+                else:
+                    time_str = f"{elapsed_total/60:.1f}m"
+
+                if elapsed_interval < 60:
+                    delta_str = f"{elapsed_interval:.0f}s"
+                else:
+                    delta_str = f"{elapsed_interval/60:.1f}m"
+
+                # Update for next interval
+                last_log_time = now
+                last_log_step = step
+
                 console.print(
                     f"Step {step}: "
                     f"train_nll={nll.item():.4f} | "
                     f"val_nll={val_nll.item():.4f} | "
                     f"mem_entropy={attn_entropy:.2f} | "
-                    f"top_slot={max_attn_slot}"
+                    f"top_slot={max_attn_slot} | "
+                    f"[cyan]{steps_per_sec:.1f} steps/s[/cyan] | "
+                    f"Time: {time_str} | Δ: {delta_str} | "
+                    f"ETA: {eta_sec/60:.1f}m"
                 )
 
                 # Save best
@@ -583,8 +616,19 @@ def train(args):
         "meta": meta,
     }, out_dir / "final.pt")
 
+    # Final timing stats
+    total_time = time.time() - train_start_time
+    total_steps = args.max_steps
+    avg_steps_per_sec = total_steps / total_time if total_time > 0 else 0
+    samples_per_sec = avg_steps_per_sec * args.batch_size
+
     console.print(f"\n[green]═══ Training Complete ═══[/]")
     console.print(f"Best val NLL: {best_val_nll:.4f}")
+    console.print(f"\n[bold cyan]⏱ Timing Summary:[/]")
+    console.print(f"  Total time: {total_time/60:.1f} min ({total_time:.1f} sec)")
+    console.print(f"  Steps/sec: {avg_steps_per_sec:.2f}")
+    console.print(f"  Samples/sec: {samples_per_sec:.0f}")
+    console.print(f"  Time per step: {1000*total_time/total_steps:.2f} ms")
 
     # ========================================================================
     # MEMORY DIAGNOSTICS
