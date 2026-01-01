@@ -198,6 +198,37 @@ nanoGpt_RH/
 
 ## 🖥️ RunPod Quick Start
 
+### ⚠️ SSH Setup (ВАЖНО! Один раз навсегда)
+
+**Проблема:** RunPod НЕ читает SSH ключи с твоего компа автоматически!
+Ключи нужно добавить в RunPod Account Settings ЗАРАНЕЕ.
+
+**Решение (один раз):**
+1. Скопируй публичный ключ: `cat ~/.ssh/id_ed25519.pub`
+2. Иди в [RunPod Settings → SSH Keys](https://www.runpod.io/console/user/settings)
+3. Добавь ключ
+4. Все НОВЫЕ поды будут работать без пароля
+
+**Если под уже создан без ключа** — добавь через Web Terminal:
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDmeQP05UiH0tXgAhL+Nx6nJZTgon9G63shnpUY9qL+2 emalam@example.com" \
+>> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+```
+
+**Подключение по SSH:**
+```bash
+# Вариант 1: через прокси (без SCP/SFTP)
+ssh vjex2o62haxaew-644114f5@ssh.runpod.io -i ~/.ssh/id_ed25519
+
+# Вариант 2: прямой TCP (с SCP/SFTP)
+ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519
+```
+
+Источник: [RunPod SSH Docs](https://docs.runpod.io/pods/configuration/use-ssh)
+
+---
+
 ### Package & Send
 ```bash
 tar czf runpod_package.tar.gz \
@@ -235,10 +266,17 @@ tar xzf results.tar.gz
 
 ### GPU Selection
 ```
+BEST:    RTX 6000 Ada @ $0.77/hr (48GB, дешевле и быстрее L40S!)
+         ↳ Low availability, но стоит подождать
 DEFAULT: L40S @ $0.86/hr (48GB, ML-optimized, high availability)
 BUDGET:  A40 @ $0.40/hr (48GB, best $/perf)
 FAST:    H100 @ $2.69/hr (80GB, 2.5x speed)
 ```
+
+**Benchmark (3 parallel, batch 512):**
+- RTX 6000 Ada: ~2.0 steps/sec each
+- L40S: ~1.6 steps/sec each
+- RTX 6000 Ada wins: дешевле ($0.77 vs $0.86) И быстрее!
 
 ---
 

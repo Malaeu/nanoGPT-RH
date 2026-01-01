@@ -215,6 +215,7 @@ class SpacingMDNPostfix(nn.Module):
         if use_aux_loss:
             self.aux_head = nn.Linear(config.n_embd, 8)  # [M, D] → [M, 8]
             console.print(f"[yellow]  Aux loss: Q3-proxy supervision enabled[/]")
+            # Note: aux_mode (mean/diagonal) is passed at training time, not stored in model
         else:
             self.aux_head = None
 
@@ -539,29 +540,38 @@ def compute_q3_targets(x: torch.Tensor) -> torch.Tensor:
     return targets
 
 
-def aux_loss_q3(aux_preds: torch.Tensor, x: torch.Tensor, n_memory_slots: int = 8) -> torch.Tensor:
+def aux_loss_q3(aux_preds: torch.Tensor, x: torch.Tensor, n_memory_slots: int = 8,
+                aux_mode: str = 'mean') -> torch.Tensor:
     """
     Compute aux loss: MSE between slot predictions and Q3-proxy targets.
 
-    E4 MODE (RESTORED): Each slot predicts ALL 8 targets, then average.
-    This gives 8x more gradient signal per slot than diagonal mode.
+    Two modes:
+    - 'mean' (E4): Each slot predicts ALL 8 targets, then average.
+                   More gradient signal but encourages slot interchangeability.
+    - 'diagonal' (E5-PR1): slot[i] predicts ONLY proxy[i].
+                           Forces specialization: each slot owns one target.
 
     Args:
         aux_preds: [B, M, 8] predictions from memory hidden states
         x: [B, T] input spacing window
         n_memory_slots: number of memory slots (M)
+        aux_mode: 'mean' or 'diagonal'
 
     Returns:
         loss: scalar MSE loss
     """
     targets = compute_q3_targets(x)  # [B, 8]
 
-    # E4 MODE: Each slot should predict the same targets (they all see same data)
-    # Average predictions across slots
-    aux_preds_mean = aux_preds.mean(dim=1)  # [B, 8]
-
-    # MSE loss
-    loss = F.mse_loss(aux_preds_mean, targets)
+    if aux_mode == 'diagonal':
+        # E5-PR1: slot[i] predicts proxy[i] only → forces specialization
+        # aux_preds: [B, M, 8], we want aux_preds[:, i, i] for each i
+        diag_preds = torch.stack([aux_preds[:, i, i] for i in range(n_memory_slots)], dim=1)  # [B, M]
+        loss = F.mse_loss(diag_preds, targets)
+    else:
+        # E4 MODE (mean): Each slot should predict the same targets
+        # Average predictions across slots
+        aux_preds_mean = aux_preds.mean(dim=1)  # [B, 8]
+        loss = F.mse_loss(aux_preds_mean, targets)
 
     return loss
 
@@ -662,9 +672,9 @@ def train(args):
     console.print(f"[bold magenta]POSTFIX Memory Training ({exp_name})[/]")
     console.print(f"[dim]Memory sees data, data doesn't see memory[/]")
     if is_e5:
-        console.print(f"[yellow]E5 mode: slot_id_mode={args.slot_id_mode}, aux_loss={args.use_aux_loss}, ortho_loss={args.use_ortho_loss}, early_stop={args.early_stop}[/]\n")
+        console.print(f"[yellow]E5 mode: slot_id_mode={args.slot_id_mode}, aux_loss={args.use_aux_loss}, aux_mode={args.aux_mode}, ortho_loss={args.use_ortho_loss}, early_stop={args.early_stop}[/]\n")
     elif is_e4:
-        console.print(f"[yellow]E4 mode: slot_id_mode={args.slot_id_mode}, aux_loss={args.use_aux_loss}, early_stop={args.early_stop}[/]\n")
+        console.print(f"[yellow]E4 mode: slot_id_mode={args.slot_id_mode}, aux_loss={args.use_aux_loss}, aux_mode={args.aux_mode}, early_stop={args.early_stop}[/]\n")
     else:
         console.print("")
 
@@ -823,7 +833,7 @@ def train(args):
                         pi, mu, sigma, aux_preds = model(x, return_aux=True)
                         mdn_loss_val = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
                         aux_weight = get_aux_weight(step)
-                        aux_loss_val = aux_loss_q3(aux_preds, x, args.n_memory_slots)
+                        aux_loss_val = aux_loss_q3(aux_preds, x, args.n_memory_slots, args.aux_mode)
                         loss = mdn_loss_val + aux_weight * aux_loss_val
                     else:
                         pi, mu, sigma = model(x)
@@ -845,7 +855,7 @@ def train(args):
                     pi, mu, sigma, aux_preds = model(x, return_aux=True)
                     mdn_loss_val = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
                     aux_weight = get_aux_weight(step)
-                    aux_loss_val = aux_loss_q3(aux_preds, x, args.n_memory_slots)
+                    aux_loss_val = aux_loss_q3(aux_preds, x, args.n_memory_slots, args.aux_mode)
                     loss = mdn_loss_val + aux_weight * aux_loss_val
                 else:
                     pi, mu, sigma = model(x)
@@ -890,6 +900,7 @@ def train(args):
                     'slot_id_mode': args.slot_id_mode,
                     'content_mode': args.content_mode,
                     'use_aux_loss': args.use_aux_loss,
+                    'aux_mode': args.aux_mode,  # E5-PR1
                     'use_ortho_loss': args.use_ortho_loss,  # E5
                     'step': step,
                     'val_nll': val_nll,
@@ -939,6 +950,7 @@ def train(args):
                     'slot_id_mode': args.slot_id_mode,
                     'content_mode': args.content_mode,
                     'use_aux_loss': args.use_aux_loss,
+                    'aux_mode': args.aux_mode,  # E5-PR1
                     'use_ortho_loss': args.use_ortho_loss,  # E5
                     'step': step,
                     'val_nll': val_nll if 'val_nll' in dir() else None,
@@ -964,6 +976,7 @@ def train(args):
         'slot_id_mode': args.slot_id_mode,
         'content_mode': args.content_mode,
         'use_aux_loss': args.use_aux_loss,
+        'aux_mode': args.aux_mode,  # E5-PR1
         'use_ortho_loss': args.use_ortho_loss,  # E5
         'step': step,
         'val_nll': best_val_nll,
@@ -1070,6 +1083,9 @@ def main():
     # E4: Aux loss
     parser.add_argument('--use-aux-loss', action='store_true', default=False,
                        help='Enable Q3-proxy aux loss supervision')
+    parser.add_argument('--aux-mode', type=str, default='mean',
+                       choices=['mean', 'diagonal'],
+                       help='Aux loss mode: mean (E4, all slots predict all), diagonal (E5-PR1, slot[i]→proxy[i])')
 
     # E4: Early stopping
     parser.add_argument('--early-stop', action='store_true', default=False,
