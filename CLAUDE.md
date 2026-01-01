@@ -2,6 +2,39 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+---
+
+## DOCUMENTATION RULES (ОБЯЗАТЕЛЬНО!)
+
+### После успешных изменений обновляй:
+
+1. **docs/PROJECT_MAP.md** — главная карта проекта
+   - Experiments Timeline (новые эксперименты)
+   - File Map (новые/измененные скрипты)
+   - Implementation Checklist (что сделано)
+   - Key Insights Log (важные открытия)
+
+2. **e*_summary.md** — саммари эксперимента (e3_summary.md, e4_summary.md и т.д.)
+   - Создавать при запуске нового эксперимента
+   - Обновлять при получении результатов
+
+### Что документировать:
+- Новые training скрипты
+- Изменения архитектуры
+- Результаты экспериментов (NLL, метрики)
+- Баги и их решения
+- Инсайты и выводы
+
+### Формат Key Insights:
+```markdown
+### YYYY-MM-DD: Краткое название
+- **Problem/Observation:** что обнаружили
+- **Evidence:** данные/метрики
+- **Conclusion/Action:** что делать дальше
+```
+
+---
+
 ## Project Overview
 
 **nanoGPT_RH** — Neural telescope for Riemann Hypothesis spectral analysis. We train a small transformer (nanoGPT) on 2M unfolded zeta zeros to:
@@ -90,24 +123,32 @@ python extract_kernel.py --checkpoint out/model.pt --output formulas/
 - **Diagnostics only (not in loss):** Mehta/GUE distribution — use as external validator, not built-in (avoids "you forced the network" criticism)
 - **Optional soft regularizers:** penalty for too many tiny spacings (level repulsion)
 
-## File Structure (planned)
+## File Structure (ACTUAL)
 
 ```
 nanoGpt_RH/
 ├── data/
-│   ├── prepare_zeros.py    # unfolding pipeline
-│   └── unfolded.pt         # preprocessed tensors
-├── model/
-│   ├── gpt.py              # transformer architecture
-│   └── config.py           # model configs
-├── train.py                # training loop
-├── eval.py                 # metrics and diagnostics
-├── extract_kernel.py       # PySR symbolic extraction
-├── notebooks/
-│   └── analysis.ipynb      # visualization
-└── config/
-    └── spacing_gpt.py      # experiment config
+│   └── continuous_2M/      # 2M unfolded spacings
+│       ├── train.pt        # (7035, 256)
+│       └── val.pt          # (781, 256)
+├── docs/
+│   ├── PROJECT_MAP.md      # ГЛАВНАЯ КАРТА ПРОЕКТА ← обновляй!
+│   └── PROJECT_GUIDE.md    # детальное ТЗ
+├── train_mdn.py            # базовый SpacingMDN
+├── train_mdn_memory.py     # PREFIX memory (deprecated)
+├── train_mdn_postfix.py    # POSTFIX memory (E3, active!)
+├── eval_mdn.py             # метрики: NLL, CRPS, PIT
+├── diagnose_memory.py      # ablation, grad corr
+├── e3_summary.md           # саммари E3 эксперимента
+├── CLAUDE.md               # этот файл
+└── out/                    # checkpoints (local/RunPod)
 ```
+
+### Current Experiment: E3 POSTFIX
+- **Script:** `train_mdn_postfix.py`
+- **Architecture:** Memory AFTER data (bottleneck readout)
+- **Status:** Running on RunPod (3 seeds)
+- **Results:** +5-10% vs E2 PREFIX
 
 ## Q3 Integration Points
 
