@@ -385,7 +385,8 @@ def measure_rollout_drift(model, data, device, horizons=[1, 10, 50, 200], n_eval
                 pred_seq.append(pred.item())
 
                 # Shift context and add prediction
-                context = torch.cat([context[:, 1:], pred.unsqueeze(0).unsqueeze(-1)], dim=1)
+                # pred is [1] (batch), need to reshape to [1, 1] for cat
+                context = torch.cat([context[:, 1:], pred.view(1, 1)], dim=1)
 
             # Compute errors at each horizon
             for h in horizons:
@@ -752,19 +753,30 @@ def run_seed_aggregation(args):
         try:
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-            # Rebuild model
-            config = MDNConfig(
-                n_embd=ckpt["config"]["n_embd"],
-                n_head=ckpt["config"]["n_head"],
-                n_layer=ckpt["config"]["n_layer"],
-                block_size=ckpt["config"]["block_size"],
-                n_mdn_components=ckpt["config"]["n_mdn_components"],
-                dropout=0.0,
-            )
+            # Rebuild model - config may be MDNConfig object or dict
+            cfg = ckpt["config"]
+            if hasattr(cfg, 'n_embd'):
+                # MDNConfig object
+                config = cfg
+                n_memory_slots = getattr(cfg, 'n_memory_slots', 8)
+                use_slot_id = getattr(cfg, 'use_slot_id', True)
+            else:
+                # Dict
+                config = MDNConfig(
+                    n_embd=cfg["n_embd"],
+                    n_head=cfg["n_head"],
+                    n_layer=cfg["n_layer"],
+                    block_size=cfg["block_size"],
+                    n_mdn_components=cfg["n_mdn_components"],
+                    dropout=0.0,
+                )
+                n_memory_slots = cfg.get("n_memory_slots", 8)
+                use_slot_id = cfg.get("use_slot_id", True)
+
             model = SpacingMDNPostfix(
                 config,
-                n_memory_slots=ckpt["config"].get("n_memory_slots", 8),
-                use_slot_id=ckpt["config"].get("use_slot_id", True),
+                n_memory_slots=n_memory_slots,
+                use_slot_id=use_slot_id,
             )
             model.load_state_dict(ckpt["model"])
             model = model.to(device)
