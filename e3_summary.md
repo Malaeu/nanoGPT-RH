@@ -13,13 +13,15 @@ POSTFIX fixes this:
 - Data CANNOT attend to memory (blocked by causal mask)
 - Readout ONLY from memory outputs (bottleneck!)
 
-## Results (in progress)
+## Results (in progress) — Updated 08:47
 
-| Experiment | Step | Best NLL | vs E2 (-0.384) |
-|------------|------|----------|----------------|
-| **s1337** | 4500 | **-0.3453** | **+10.1%** |
-| **s42** | 3000 | **-0.3484** | **+9.3%** |
-| **s7** | 1000 | **-0.3646** | **+5.1%** |
+| Experiment | Step | Best NLL | vs E2 (-0.384) | Progress |
+|------------|------|----------|----------------|----------|
+| **s1337** | 6500 | **-0.3453** | **+10.1%** | 32.5% |
+| **s42** | 5000 | **-0.3397** | **+11.5%** | 25% |
+| **s7** | 3000 | **-0.3286** | **+14.4%** 🏆 | 15% |
+
+**Best so far: s7 with -0.3286 (+14.4% vs E2!)**
 
 ## Comparison with Previous
 
@@ -27,9 +29,9 @@ POSTFIX fixes this:
 |------------|--------------|----------|--------|
 | E1 | PREFIX | -0.3793 | completed |
 | E2 | PREFIX | -0.3840 | completed |
-| **E3 s1337** | **POSTFIX** | **-0.3453** | running |
-| **E3 s42** | **POSTFIX** | **-0.3484** | running |
-| **E3 s7** | **POSTFIX** | **-0.3646** | running |
+| **E3 s1337** | **POSTFIX** | **-0.3453** | 🔄 32.5% |
+| **E3 s42** | **POSTFIX** | **-0.3397** | 🔄 25% |
+| **E3 s7** | **POSTFIX** | **-0.3286** 🏆 | 🔄 15% |
 
 ## Why POSTFIX Works Better
 

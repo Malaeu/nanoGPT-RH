@@ -2,7 +2,7 @@
 
 > Автогенерируемая карта проекта. Обновляется после каждого значимого изменения.
 
-**Last Updated:** 2026-01-01
+**Last Updated:** 2026-01-01 (auto-changelog v2)
 **Current Focus:** E3 POSTFIX Memory Experiments
 
 ---
@@ -70,8 +70,9 @@ Result: Memory becomes ESSENTIAL (true register)
 | File | Purpose | Status |
 |------|---------|--------|
 | `eval_mdn.py` | NLL, CRPS, PIT metrics | ✅ works |
-| `diagnose_memory.py` | Ablation, grad corr, slot analysis | ⚠️ needs postfix update |
-| `test_slot_effect.py` | Per-slot ablation | ⚠️ needs postfix update |
+| `diagnose_memory.py` | Ablation, grad corr (PREFIX) | ✅ for E1/E2 |
+| `diagnose_memory_postfix.py` | Ablation, grad corr (POSTFIX) | ✅ NEW for E3 |
+| `test_slot_effect.py` | Per-slot ablation | ⚠️ PREFIX only |
 
 ### Data
 | Path | Contents | Shape |
@@ -121,16 +122,18 @@ Result: Memory becomes ESSENTIAL (true register)
 - [ ] Orthogonality loss (slots don't collapse)
 - [ ] Norm cap (slots don't dominate)
 
-### Extended Diagnostics ⚠️ (partial)
+### Extended Diagnostics ✅ (diagnose_memory_postfix.py)
 - [x] Val NLL
 - [x] Readout weights visualization
 - [x] Slot norms visualization
 - [x] Timing summary
-- [ ] CRPS metric
-- [ ] PIT calibration
-- [ ] Rollout Err@h
-- [ ] Grad correlation logging
-- [ ] Attention mass memory→data
+- [x] Ablation study (slot_off)
+- [x] Gradient correlation
+- [x] Slot similarity matrix
+- [x] Slot effect norm
+- [ ] CRPS metric (in eval_mdn.py)
+- [ ] PIT calibration (in eval_mdn.py)
+- [ ] Rollout Err@h (in eval_mdn.py)
 
 ---
 
@@ -150,6 +153,11 @@ Result: Memory becomes ESSENTIAL (true register)
 - **Observation:** NLL improved by 5-10% vs E2
 - **Status:** Training in progress, 3 seeds running
 - **Next:** Wait for completion, run diagnostics
+
+### 2026-01-01: E3 Progress Update
+- **Results:** s7 leading with -0.3286 (+14.4% vs E2!)
+- **Created:** `diagnose_memory_postfix.py` for POSTFIX diagnostics
+- **Next:** Run diagnostics when training completes
 
 ---
 
