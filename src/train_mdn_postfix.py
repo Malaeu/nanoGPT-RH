@@ -89,6 +89,10 @@ class MemoryBankPostfix(nn.Module):
         self.slot_id_mode = slot_id_mode
         self.content_mode = content_mode
 
+        # E5.5: Separate eval mode for deterministic validation
+        self.eval_slot_id_mode = 'fixed'  # Use fixed IDs during eval by default
+        self._eval_perm_seed = None  # For reproducible multi-perm eval
+
         # Learnable memory content
         self.memory = nn.Parameter(torch.randn(n_slots, n_embd) * 0.02)
 
@@ -99,6 +103,10 @@ class MemoryBankPostfix(nn.Module):
         # Learnable readout weights for pooling memory outputs
         self.readout_weights = nn.Parameter(torch.zeros(n_slots))
 
+    def set_eval_perm_seed(self, seed: Optional[int]):
+        """Set seed for reproducible permutation during eval."""
+        self._eval_perm_seed = seed
+
     def forward(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Return memory tokens expanded for batch: [B, M, D]"""
         # Content: normal or zeroed
@@ -107,16 +115,25 @@ class MemoryBankPostfix(nn.Module):
         else:
             memory = self.memory  # [M, D]
 
+        # E5.5: Use eval_slot_id_mode when not training
+        effective_mode = self.slot_id_mode
+        if not self.training:
+            effective_mode = self.eval_slot_id_mode
+
         # Slot-ID: fixed, off, or permute_per_batch
-        if self.slot_id_mode == 'fixed':
+        if effective_mode == 'fixed':
             slot_ids = torch.arange(self.n_slots, device=device)
             memory = memory + self.slot_id(slot_ids)
-        elif self.slot_id_mode == 'permute_per_batch':
-            # Random permutation per batch (breaks ID reliance during training)
-            perm = torch.randperm(self.n_slots, device=device)
-            slot_ids = perm
-            memory = memory + self.slot_id(slot_ids)
-        # else: slot_id_mode == 'off' → no ID added
+        elif effective_mode == 'permute_per_batch':
+            # Use seeded RNG for reproducible permutations during eval
+            if not self.training and self._eval_perm_seed is not None:
+                g = torch.Generator(device=device)
+                g.manual_seed(self._eval_perm_seed)
+                perm = torch.randperm(self.n_slots, device=device, generator=g)
+            else:
+                perm = torch.randperm(self.n_slots, device=device)
+            memory = memory + self.slot_id(perm)
+        # else: effective_mode == 'off' → no ID added
 
         return memory.unsqueeze(0).expand(batch_size, -1, -1)  # [B, M, D]
 
@@ -399,6 +416,61 @@ def mdn_loss_1step(pi: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor,
 
 
 # ============================================================================
+# E5.5: MULTI-PERMUTATION EVAL
+# ============================================================================
+
+def eval_with_perm_average(model, val_loader, device, n_perms: int = 1):
+    """
+    Evaluate model with optional multi-permutation averaging.
+
+    Args:
+        model: SpacingMDNPostfix model
+        val_loader: validation data loader
+        device: torch device
+        n_perms: number of permutations to average (1=fixed, >1=multi-perm)
+
+    Returns:
+        val_nll: mean NLL
+        val_std: std of NLL across permutations (0 if n_perms=1)
+    """
+    model.eval()
+
+    if n_perms == 1:
+        # Single fixed eval (default, deterministic)
+        # eval_slot_id_mode is already 'fixed' by default
+        val_losses = []
+        with torch.no_grad():
+            for vx, vy in val_loader:
+                vx, vy = vx.to(device), vy.to(device)
+                vpi, vmu, vsigma = model(vx)
+                vloss = mdn_loss_1step(vpi, vmu, vsigma, vy, entropy_reg=0)
+                val_losses.append(vloss.item())
+        return np.mean(val_losses), 0.0
+
+    # Multi-perm eval: temporarily switch to permute mode with seeds
+    original_mode = model.memory_bank.eval_slot_id_mode
+    model.memory_bank.eval_slot_id_mode = 'permute_per_batch'
+    all_nlls = []
+
+    with torch.no_grad():
+        for i in range(n_perms):
+            model.memory_bank.set_eval_perm_seed(42 + i)  # Reproducible seed per run
+            perm_nlls = []
+            for vx, vy in val_loader:
+                vx, vy = vx.to(device), vy.to(device)
+                vpi, vmu, vsigma = model(vx)
+                vloss = mdn_loss_1step(vpi, vmu, vsigma, vy, entropy_reg=0)
+                perm_nlls.append(vloss.item())
+            all_nlls.append(np.mean(perm_nlls))
+
+    # Reset to original mode
+    model.memory_bank.eval_slot_id_mode = original_mode
+    model.memory_bank.set_eval_perm_seed(None)
+
+    return np.mean(all_nlls), np.std(all_nlls)
+
+
+# ============================================================================
 # Q3-PROXY TARGETS (E4)
 # ============================================================================
 
@@ -468,7 +540,17 @@ def compute_q3_targets(x: torch.Tensor) -> torch.Tensor:
 
 def aux_loss_q3(aux_preds: torch.Tensor, x: torch.Tensor, n_memory_slots: int = 8) -> torch.Tensor:
     """
-    Compute aux loss: MSE between slot predictions and Q3-proxy targets.
+    Compute aux loss: DIAGONAL MSE between slot predictions and Q3-proxy targets.
+
+    E5 CHANGE: Each slot is responsible for ONE specific target (breaks symmetry!).
+    - Slot 0 → M0 (mean deviation)
+    - Slot 1 → M1 (entropy)
+    - Slot 2 → M2 (max|dx|)
+    - Slot 3 → M3 (quantile 0.01)
+    - Slot 4 → M4 (curvature)
+    - Slot 5 → M5 (half-window divergence)
+    - Slot 6 → M6 (high-freq energy)
+    - Slot 7 → M7 (local rigidity)
 
     Args:
         aux_preds: [B, M, 8] predictions from memory hidden states
@@ -476,18 +558,17 @@ def aux_loss_q3(aux_preds: torch.Tensor, x: torch.Tensor, n_memory_slots: int = 
         n_memory_slots: number of memory slots (M)
 
     Returns:
-        loss: scalar MSE loss
-
-    Note: Each slot predicts all 8 targets. We average across slots.
+        loss: scalar MSE loss (diagonal only)
     """
     targets = compute_q3_targets(x)  # [B, 8]
+    B = targets.size(0)
 
-    # Each slot should predict the same targets (they all see same data)
-    # Average predictions across slots
-    aux_preds_mean = aux_preds.mean(dim=1)  # [B, 8]
+    # DIAGONAL: slot i predicts target i
+    # Extract diagonal: aux_preds[:, i, i] for i in 0..7
+    diag_preds = torch.stack([aux_preds[:, i, i] for i in range(min(n_memory_slots, 8))], dim=1)  # [B, 8]
 
-    # MSE loss
-    loss = F.mse_loss(aux_preds_mean, targets)
+    # MSE loss on diagonal only
+    loss = F.mse_loss(diag_preds, targets)
 
     return loss
 
@@ -513,17 +594,83 @@ def get_aux_weight(step: int) -> float:
 
 
 # ============================================================================
+# ORTHOGONALITY LOSS (E5 STEP 2)
+# ============================================================================
+
+def compute_ortho_loss(memory_bank: nn.Module) -> torch.Tensor:
+    """
+    Compute orthogonality loss on memory slot embeddings.
+
+    Forces slots to be "different directions" in embedding space,
+    breaking the symmetry/interchangeability that causes low Ablation Δ.
+
+    Loss = ||G - I||_F^2 where G = normalized Gram matrix
+
+    Args:
+        memory_bank: MemoryBankPostfix module
+
+    Returns:
+        ortho_loss: scalar penalty
+    """
+    # Get memory content [M, D]
+    mem = memory_bank.memory  # [M, D]
+
+    # Normalize to unit vectors
+    mem_norm = F.normalize(mem, p=2, dim=1)  # [M, D]
+
+    # Gram matrix: cosine similarity between all pairs
+    gram = mem_norm @ mem_norm.T  # [M, M]
+
+    # Target: identity matrix (each slot orthogonal to others)
+    M = gram.size(0)
+    identity = torch.eye(M, device=gram.device)
+
+    # Frobenius norm of (G - I)
+    ortho_loss = ((gram - identity) ** 2).sum()
+
+    return ortho_loss
+
+
+def get_ortho_weight(step: int) -> float:
+    """
+    Ramp schedule for orthogonality loss weight.
+
+    E5 STEP 2 Schedule:
+        step 0-500:      0 → 1e-3 (warmup)
+        step 500-5000:   1e-3 → 1e-2 (ramp up)
+        step 5000+:      1e-2 (hold)
+    """
+    if step < 500:
+        # Linear warmup 0 → 1e-3
+        return 1e-3 * (step / 500.0)
+    elif step < 5000:
+        # Linear ramp 1e-3 → 1e-2
+        progress = (step - 500) / (5000 - 500)
+        return 1e-3 + progress * (1e-2 - 1e-3)
+    else:
+        return 1e-2
+
+
+# ============================================================================
 # TRAINING
 # ============================================================================
 
 def train(args):
     # Determine experiment version
+    is_e5 = args.use_ortho_loss  # E5 STEP 2: orthogonality loss
     is_e4 = args.slot_id_mode != 'fixed' or args.use_aux_loss or args.early_stop
-    exp_name = "E4" if is_e4 else "E3"
+    if is_e5:
+        exp_name = "E5"
+    elif is_e4:
+        exp_name = "E4"
+    else:
+        exp_name = "E3"
 
     console.print(f"[bold magenta]POSTFIX Memory Training ({exp_name})[/]")
     console.print(f"[dim]Memory sees data, data doesn't see memory[/]")
-    if is_e4:
+    if is_e5:
+        console.print(f"[yellow]E5 mode: slot_id_mode={args.slot_id_mode}, aux_loss={args.use_aux_loss}, ortho_loss={args.use_ortho_loss}, early_stop={args.early_stop}[/]\n")
+    elif is_e4:
         console.print(f"[yellow]E4 mode: slot_id_mode={args.slot_id_mode}, aux_loss={args.use_aux_loss}, early_stop={args.early_stop}[/]\n")
     else:
         console.print("")
@@ -622,8 +769,8 @@ def train(args):
     best_val_nll = float('inf')
     train_iter = iter(train_loader)
 
-    # Early stopping
-    patience_counter = 0
+    # Early stopping (E5: patience in STEPS, not eval iterations)
+    best_step = 0
     early_stopped = False
 
     # Log file
@@ -642,6 +789,12 @@ def train(args):
 
         start_time = time.time()
 
+        # E5.5: Separate timing for train vs eval
+        train_time_total = 0.0
+        eval_time_total = 0.0
+        last_eval_step = 0
+        last_eval_time = start_time
+
         while step < args.max_steps:
             # Get batch
             try:
@@ -652,7 +805,18 @@ def train(args):
 
             x, y = x.to(device), y.to(device)
 
+            # E5.5: Time the training step
+            train_step_start = time.time()
+
             model.train()
+
+            # E5.5: Perm warmup - use fixed IDs during warmup period
+            if args.perm_warmup_steps > 0 and args.slot_id_mode == 'permute_per_batch':
+                if step < args.perm_warmup_steps:
+                    model.memory_bank.slot_id_mode = 'fixed'
+                else:
+                    model.memory_bank.slot_id_mode = 'permute_per_batch'
+
             optimizer.zero_grad(set_to_none=True)
 
             # Forward pass with optional AMP
@@ -667,6 +831,12 @@ def train(args):
                     else:
                         pi, mu, sigma = model(x)
                         loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+
+                    # E5 STEP 2: Orthogonality loss on memory slots
+                    if args.use_ortho_loss:
+                        ortho_weight = get_ortho_weight(step)
+                        ortho_loss_val = compute_ortho_loss(model.memory_bank)
+                        loss = loss + ortho_weight * ortho_loss_val
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -683,28 +853,39 @@ def train(args):
                 else:
                     pi, mu, sigma = model(x)
                     loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+
+                # E5 STEP 2: Orthogonality loss on memory slots
+                if args.use_ortho_loss:
+                    ortho_weight = get_ortho_weight(step)
+                    ortho_loss_val = compute_ortho_loss(model.memory_bank)
+                    loss = loss + ortho_weight * ortho_loss_val
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
 
             scheduler.step()
+
+            # E5.5: Accumulate train time
+            train_time_total += time.time() - train_step_start
+
             step += 1
             progress.update(task, advance=1)
 
             # Validation
             if step % args.eval_every == 0:
-                model.eval()
-                val_losses = []
-                with torch.no_grad():
-                    for vx, vy in val_loader:
-                        vx, vy = vx.to(device), vy.to(device)
-                        vpi, vmu, vsigma = model(vx)
-                        vloss = mdn_loss_1step(vpi, vmu, vsigma, vy, entropy_reg=0)
-                        val_losses.append(vloss.item())
+                # E5.5: Time the eval
+                eval_start = time.time()
 
-                val_nll = np.mean(val_losses)
+                # E5.5: Use eval_with_perm_average for optional multi-perm eval
+                val_nll, val_std = eval_with_perm_average(
+                    model, val_loader, device, n_perms=args.eval_perm_average
+                )
 
-                # Save checkpoint with E4 fields
+                # E5.5: Accumulate eval time
+                eval_time_total += time.time() - eval_start
+
+                # Save checkpoint with E4/E5 fields
                 ckpt = {
                     'model': model.state_dict(),
                     'config': config,
@@ -712,30 +893,41 @@ def train(args):
                     'slot_id_mode': args.slot_id_mode,
                     'content_mode': args.content_mode,
                     'use_aux_loss': args.use_aux_loss,
+                    'use_ortho_loss': args.use_ortho_loss,  # E5
                     'step': step,
                     'val_nll': val_nll,
                     'architecture': 'POSTFIX',
-                    'experiment': 'E4' if is_e4 else 'E3'
+                    'experiment': exp_name
                 }
 
                 if val_nll < best_val_nll:
                     best_val_nll = val_nll
-                    patience_counter = 0
+                    best_step = step  # E5: track step, not counter
                     torch.save(ckpt, out_dir / 'best.pt')
-                else:
-                    patience_counter += 1
 
-                # Log
+                # Log with E5.5 separate timing
                 elapsed = time.time() - start_time
-                msg = f"Step {step}: val_nll={val_nll:.4f} (best={best_val_nll:.4f}) elapsed={elapsed/60:.1f}m"
+                steps_since_best = step - best_step
+
+                # E5.5: Calculate train speed (excluding eval) and interval speed
+                train_speed = step / train_time_total if train_time_total > 0 else 0
+                interval_steps = step - last_eval_step
+                interval_time = time.time() - last_eval_time
+                interval_speed = interval_steps / interval_time if interval_time > 0 else 0
+
+                msg = f"Step {step}: val_nll={val_nll:.4f} (best={best_val_nll:.4f}) | train:{train_speed:.1f} s/s | int:{interval_speed:.1f} s/s | elapsed={elapsed/60:.1f}m"
                 if args.early_stop:
-                    msg += f" patience={patience_counter}/{args.patience}"
+                    msg += f" | stale={steps_since_best}/{args.patience}"
                 console.print(f"[dim]{msg}[/]")
                 log_file.write(msg + '\n')
                 log_file.flush()
 
-                # Early stopping check
-                if args.early_stop and patience_counter >= args.patience:
+                # E5.5: Update interval tracking
+                last_eval_step = step
+                last_eval_time = time.time()
+
+                # Early stopping check (E5: patience in STEPS)
+                if args.early_stop and steps_since_best >= args.patience:
                     console.print(f"[yellow]Early stopping triggered at step {step}[/]")
                     log_file.write(f"Early stopping triggered at step {step}\n")
                     early_stopped = True
@@ -750,10 +942,11 @@ def train(args):
                     'slot_id_mode': args.slot_id_mode,
                     'content_mode': args.content_mode,
                     'use_aux_loss': args.use_aux_loss,
+                    'use_ortho_loss': args.use_ortho_loss,  # E5
                     'step': step,
                     'val_nll': val_nll if 'val_nll' in dir() else None,
                     'architecture': 'POSTFIX',
-                    'experiment': 'E4' if is_e4 else 'E3'
+                    'experiment': exp_name
                 }
                 torch.save(ckpt, out_dir / f'ckpt_{step}.pt')
 
@@ -774,10 +967,11 @@ def train(args):
         'slot_id_mode': args.slot_id_mode,
         'content_mode': args.content_mode,
         'use_aux_loss': args.use_aux_loss,
+        'use_ortho_loss': args.use_ortho_loss,  # E5
         'step': step,
         'val_nll': best_val_nll,
         'architecture': 'POSTFIX',
-        'experiment': 'E4' if is_e4 else 'E3',
+        'experiment': exp_name,
         'early_stopped': early_stopped
     }
     torch.save(ckpt, out_dir / 'final.pt')
@@ -881,7 +1075,17 @@ def main():
     parser.add_argument('--early-stop', action='store_true', default=False,
                        help='Enable early stopping')
     parser.add_argument('--patience', type=int, default=800,
-                       help='Early stopping patience (in eval steps)')
+                       help='Early stopping patience (E5: in training STEPS)')
+
+    # E5: Orthogonality loss
+    parser.add_argument('--use-ortho-loss', action='store_true', default=False,
+                       help='Enable orthogonality loss on memory slots (E5 STEP 2)')
+
+    # E5.5: Eval and warmup options
+    parser.add_argument('--eval-perm-average', type=int, default=1,
+                       help='Number of permutations to average during eval (1=fixed, >1=multi-perm)')
+    parser.add_argument('--perm-warmup-steps', type=int, default=0,
+                       help='Steps before enabling permute_per_batch (0=always on)')
 
     # Training
     parser.add_argument('--seq-len', type=int, default=257,
