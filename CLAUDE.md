@@ -1,185 +1,163 @@
-# CLAUDE.md
+# CLAUDE.md — nanoGPT_RH Quick Reference
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+> **Читай это ПЕРВЫМ при входе в проект!**
+> Здесь все пути, конвенции, workflow — чтобы не учить структуру заново.
 
 ---
 
-## TRAINING LOGGING RULES (КРИТИЧНО!)
+## 🎯 QUICK REFERENCE (Jan 2026)
 
-При запуске тренировки ВСЕГДА показывать в логах:
+### Current Status
+```
+✅ E4 COMPLETE — ID-Detox works!
+⭐ Best Model: checkpoints/E4_s7_best.pt (NLL=0.1942)
+📍 Next: E5 (slot specialization) OR symbolic extraction
+```
 
-1. **В начале тренировки:**
-   - GPU name (nvidia-smi)
-   - VRAM total / used
-   - batch_size
-   - Estimated steps/sec (после первых 100 steps)
+### Key Paths (ЗАПОМНИ!)
+```
+INPUT:
+  data/continuous_2M/train.pt    # (7035, 256) training data
+  data/continuous_2M/val.pt      # (781, 256) validation data
 
-2. **Каждые N steps (eval):**
-   - Current step / total steps
-   - val_nll (и best)
-   - Elapsed time
-   - **steps/sec** (текущая скорость!)
-   - **ETA** (сколько осталось!)
-   - patience (если early-stop)
+CODE:
+  src/train_mdn_postfix.py       # ⭐ Main training script
+  src/eval_mdn.py                # Evaluation
+  src/diagnose_memory_postfix.py # Diagnostics
 
-3. **В конце тренировки:**
-   - Total time
-   - Total steps
-   - Final steps/sec
-   - samples/sec
-   - Cost estimate ($/hr × time)
+OUTPUT:
+  out/                           # Temporary (gitignored)
+  checkpoints/                   # Final models (in git)
+  results/                       # Diagnostics output (in git)
 
-**Пример формата лога:**
+DOCS:
+  docs/PROJECT_MAP.md            # ⭐ Main project map
+  docs/E4_SPEC.md                # E4 specification
+  docs/runpod_specs.md           # GPU comparison
+```
+
+---
+
+## 🔄 EXPERIMENT WORKFLOW
+
+### Запуск нового эксперимента (E5, E6, etc.)
+
+**Шаг 1: Создай рабочую папку**
+```bash
+mkdir -p out/E5_experiment_name
+```
+
+**Шаг 2: Запусти тренировку**
+```bash
+python src/train_mdn_postfix.py \
+  --data-dir data/continuous_2M \
+  --out-dir out/E5_experiment_name \
+  --seed 7 \
+  [новые флаги] \
+  --batch-size 512 --use-amp
+```
+
+**Шаг 3: После завершения — раскладываем результаты**
+```bash
+# Лучшая модель → checkpoints/
+cp out/E5_experiment_name/best.pt checkpoints/E5_best.pt
+
+# Диагностика → results/
+mkdir -p results/E5
+python src/diagnose_memory_postfix.py \
+  --ckpt checkpoints/E5_best.pt \
+  --data-dir data/continuous_2M \
+  --output-dir results/E5
+
+# Обнови docs/PROJECT_MAP.md с результатами!
+```
+
+**Шаг 4: Cleanup временных файлов**
+```bash
+# out/ в gitignore — можно удалить или оставить локально
+rm -rf out/E5_experiment_name/ckpt_*.pt  # удалить промежуточные
+```
+
+---
+
+## 📁 I/O CONVENTIONS
+
+### Naming Rules
+```
+Checkpoints:  E{N}_{description}_best.pt
+              E4_s7_best.pt, E5_ortho_best.pt
+
+Results:      results/E{N}/
+              results/E4_s7/postfix_diagnostics.jsonl
+
+Logs:         out/E{N}_{name}/train.log (temporary)
+```
+
+### Input Paths (НИКОГДА не меняй!)
+```python
+DATA_DIR = "data/continuous_2M"
+TRAIN_PATH = "data/continuous_2M/train.pt"  # (7035, 256)
+VAL_PATH = "data/continuous_2M/val.pt"      # (781, 256)
+```
+
+### Output Paths
+```python
+# Temporary (during training):
+OUT_DIR = f"out/{experiment_name}"
+
+# Permanent (after training):
+CHECKPOINT = f"checkpoints/{experiment_name}_best.pt"
+RESULTS = f"results/{experiment_name}/"
+```
+
+---
+
+## 📝 LOGGING RULES (КРИТИЧНО!)
+
+### При тренировке ОБЯЗАТЕЛЬНО логировать:
+
+**В начале:**
+- GPU name, VRAM
+- batch_size
+- Experiment config (flags)
+
+**Каждый eval:**
 ```
 Step 1000/20000 | val_nll=0.358 (best=0.358) | 5.8 steps/s | ETA: 55m | elapsed: 2.9m
 ```
 
-**ЗАЧЕМ:** Чтобы сравнивать GPU и выбирать оптимальный под!
-См. `docs/runpod_specs.md` для бенчмарков.
+**В конце:**
+- Total time, steps/sec
+- Best NLL achieved
+- Cost estimate ($/hr × time)
 
 ---
 
-## DOCUMENTATION RULES (ОБЯЗАТЕЛЬНО!)
+## 📋 ПОСЛЕ КАЖДОГО ЭКСПЕРИМЕНТА
 
-### После успешных изменений обновляй:
-
-1. **docs/PROJECT_MAP.md** — главная карта проекта
-   - Experiments Timeline (новые эксперименты)
-   - File Map (новые/измененные скрипты)
-   - Implementation Checklist (что сделано)
-   - Key Insights Log (важные открытия)
-
-2. **e*_summary.md** — саммари эксперимента (e3_summary.md, e4_summary.md и т.д.)
-   - Создавать при запуске нового эксперимента
-   - Обновлять при получении результатов
-
-### Что документировать:
-- Новые training скрипты
-- Изменения архитектуры
-- Результаты экспериментов (NLL, метрики)
-- Баги и их решения
-- Инсайты и выводы
-
-### Формат Key Insights:
-```markdown
-### YYYY-MM-DD: Краткое название
-- **Problem/Observation:** что обнаружили
-- **Evidence:** данные/метрики
-- **Conclusion/Action:** что делать дальше
-```
+### Checklist:
+- [ ] Скопировать `best.pt` в `checkpoints/`
+- [ ] Запустить диагностику в `results/`
+- [ ] Обновить `docs/PROJECT_MAP.md`:
+  - Experiments Timeline
+  - E{N} Results table
+  - Key Insights Log
+- [ ] Commit & push
 
 ---
 
-## Project Overview
-
-**nanoGPT_RH** — Neural telescope for Riemann Hypothesis spectral analysis. We train a small transformer (nanoGPT) on 2M unfolded zeta zeros to:
-1. Learn stationary statistics (GUE-like spacing distribution, spectral rigidity)
-2. Extract hidden state geometry ("helmet" manifold)
-3. Distill operator/kernel approximation via attention logits + PySR symbolic regression
-
-This is NOT a "prove RH with neural nets" project. It's a controlled lab to study spectral invariants and compare with Q3 kernel/operator structures (Toeplitz-RKHS bridge, prime cap, uniform floor c*=11/10).
-
-## Architecture Philosophy
-
-- **nanoGPT over large LLMs** — we need observability, not chat power
-- **Continuous or binned spacings** — NOT text tokenization (avoid "14.1347" as chunks)
-- **Tabula rasa** — if small model learns spectral invariants from scratch, that's stronger scientific signal
-- **Attention ≈ Kernel** — attention logits A_ij as function of distance d=|u_i-u_j|
-
-## Data Pipeline
-
-### Unfolding (critical preprocessing)
-
-Raw zeros → unfolded spacings with mean ≈ 1:
-
-**Variant A (local density):**
-```
-Δ_n = γ_{n+1} - γ_n
-s_n = Δ_n * log(γ_n) / (2π)
-```
-
-**Variant B (unfolded coordinates):**
-```
-u(γ) = (γ/2π) * log(γ/(2πe))
-s_n = u(γ_{n+1}) - u(γ_n)
-```
-
-Quality check: mean(s) ≈ 1 on large blocks.
-
-### Sequence formatting
-- Sequence length L=256 (configurable)
-- Train/val split BY BLOCKS (no shuffling — preserves structure)
-
-## Commands
-
-```bash
-# Setup environment (uv + Python 3.13)
-uv venv && source .venv/bin/activate
-uv pip install torch numpy scipy matplotlib rich
-
-# Data prep
-python scripts/prepare_continuous_2M.py --input zeros_2M.txt --output data/continuous_2M
-
-# E4 Training (POSTFIX + ID-Detox)
-python src/train_mdn_postfix.py \
-  --data-dir data/continuous_2M \
-  --out-dir out/mdn_postfix_E4_s7 \
-  --seed 7 \
-  --slot-id-mode permute_per_batch \
-  --use-aux-loss \
-  --early-stop --patience 800 \
-  --batch-size 512 --use-amp
-
-# Evaluation
-python src/eval_mdn.py --ckpt checkpoints/E4_s7_best.pt --data-dir data/continuous_2M
-
-# Diagnostics
-python src/diagnose_memory_postfix.py \
-  --ckpt checkpoints/E4_s7_best.pt \
-  --data-dir data/continuous_2M \
-  --output-dir results/E4_s7
-```
-
-## Key Experiments
-
-### Baselines (mandatory sanity checks)
-1. **Shuffled spacings** — destroy correlations, keep marginals
-2. **i.i.d. resample** — sample from empirical distribution
-3. **Positional encoding only** — no learned weights
-
-### Metrics
-- Spacing histogram vs GUE Wigner surmise: P(s) = (πs/2)exp(-πs²/4)
-- Spectral form factor: ramp → plateau transition
-- Hidden state manifold stability across seeds
-
-### Kernel extraction
-1. Collect attention logits A_ij before softmax
-2. Build dataset (d_k, y_k) where d = |u_i - u_j|
-3. Run PySR: look for sine-kernel-like forms on Pareto front
-
-## Model Choice
-
-**Phase 1:** nanoGPT / minGPT / tiny Transformer (fast iterations on Mac)
-**Phase 2:** Larger models when metrics and signal are clear
-
-## Loss Design
-
-- **Primary:** next-spacing prediction (MSE for regression, CE for bins)
-- **Diagnostics only (not in loss):** Mehta/GUE distribution — use as external validator, not built-in (avoids "you forced the network" criticism)
-- **Optional soft regularizers:** penalty for too many tiny spacings (level repulsion)
-
-## Repository Structure (Jan 2026)
+## 🏗️ Repository Structure
 
 ```
 nanoGpt_RH/
 │
 ├── 📁 src/                      # MAIN CODE
-│   ├── train_mdn.py             # Base SpacingMDN (MDNConfig, transformer)
-│   ├── train_mdn_postfix.py     # E4 POSTFIX training (ID-Detox, aux-loss)
+│   ├── train_mdn.py             # Base SpacingMDN (MDNConfig)
+│   ├── train_mdn_postfix.py     # ⭐ E4 training (ID-Detox, aux-loss)
 │   ├── train_mdn_memory.py      # PREFIX memory (deprecated)
 │   ├── eval_mdn.py              # Evaluation (NLL, CRPS, PIT)
 │   ├── diagnose_memory.py       # PREFIX diagnostics
-│   └── diagnose_memory_postfix.py # POSTFIX diagnostics (A-K metrics)
+│   └── diagnose_memory_postfix.py # ⭐ POSTFIX diagnostics (A-K)
 │
 ├── 📁 scripts/                  # UTILITIES
 │   ├── prepare_continuous_2M.py # Unfolding zeros → spacings
@@ -189,185 +167,169 @@ nanoGpt_RH/
 │
 ├── 📁 checkpoints/              # TRAINED MODELS (Git LFS)
 │   ├── E0_baseline_best.pt      # SpacingMDN no memory
-│   ├── E1_prefix_best.pt        # PREFIX memory (decorative)
-│   ├── E2_prefix_best.pt        # PREFIX memory (seed variance)
+│   ├── E1_prefix_best.pt        # PREFIX (decorative)
+│   ├── E2_prefix_best.pt        # PREFIX (seed variance)
 │   ├── E3_postfix_s1337_best.pt # POSTFIX (ID-crutch)
-│   ├── E4_s7_best.pt            # ⭐ BEST! NLL=0.1942, ID-Detox works!
-│   └── E4_s1337_best.pt         # POSTFIX + ID-Detox (stuck seed)
+│   ├── E4_s7_best.pt            # ⭐ BEST! NLL=0.1942
+│   └── E4_s1337_best.pt         # E4 (stuck seed)
 │
 ├── 📁 data/                     # DATASET
-│   ├── continuous_2M/           # Main dataset
-│   │   ├── train.pt             # (7035, 256) training spacings
-│   │   ├── val.pt               # (781, 256) validation spacings
-│   │   └── meta.pt              # Dataset metadata
-│   ├── train.pt, val.pt         # Copies in root
-│   └── *_primes.pt              # Prime gaps dataset
+│   └── continuous_2M/           # Main dataset
+│       ├── train.pt             # (7035, 256)
+│       ├── val.pt               # (781, 256)
+│       └── meta.pt
 │
 ├── 📁 docs/                     # DOCUMENTATION
-│   ├── PROJECT_MAP.md           # ⭐ MAIN PROJECT MAP (experiments, results)
-│   ├── E4_SPEC.md               # E4 specification (ID-Detox)
-│   ├── runpod_specs.md          # GPU comparison & benchmarks
-│   ├── PROJECT_GUIDE.md         # Detailed project guide
-│   └── *.md                     # Session summaries, drafts
+│   ├── PROJECT_MAP.md           # ⭐ MAIN PROJECT MAP
+│   ├── E4_SPEC.md               # E4 specification
+│   └── runpod_specs.md          # GPU comparison
 │
 ├── 📁 results/                  # DIAGNOSTICS OUTPUT
 │   └── E4_s7/
-│       ├── postfix_diagnostics.jsonl  # Metrics JSON
-│       └── postfix_diagnostics.png    # Visualization
+│       ├── postfix_diagnostics.jsonl
+│       └── postfix_diagnostics.png
 │
-├── 📁 archive/                  # OLD CODE (gitignored)
-│   ├── old_training/            # Deprecated train_*.py
-│   ├── analysis/                # Old analysis scripts
-│   └── images/                  # Old PNG files
+├── 📁 out/                      # TEMPORARY (gitignored)
 │
-├── CLAUDE.md                    # THIS FILE
-├── README.md                    # Project readme
-└── .gitignore                   # Git ignore rules
+└── 📁 archive/                  # OLD CODE (gitignored)
 ```
 
-### Current Status: E4 COMPLETE ✅
-- **Best Model:** `checkpoints/E4_s7_best.pt`
-- **NLL:** 0.1942 (+36% vs E3!)
-- **ID-Detox:** Works! Perm Inc = 1.0%
-- **Next:** E5 (slot specialization) or symbolic extraction
+---
 
-## Q3 Integration Points
+## 🖥️ RunPod Quick Start
 
-Cross-reference with Q3 formal structures:
-- Attention logits → compare with sine kernel / Toeplitz symbol
-- Operator norm cap → check if learned interactions respect bounds
-- Prime block structure → compare attention patterns with ρ(t) formulation
-
-## Notes
-
-- 256 bins for spacing classification gives stable perplexity metric
-- RoPE / sinusoidal positional encoding justified for sequence + phase structure
-- Save hidden states during training for manifold analysis
-
-## RunPod GPU Training Guide
-
-### ОДНА КОМАНДА для полного pipeline
-
-**НА МАКЕ (подготовка):**
+### Package & Send
 ```bash
-cd /Users/emalam/Documents/GitHub/nanoGpt_RH
-
-# Создать пакет
 tar czf runpod_package.tar.gz \
   src/train_mdn.py src/train_mdn_postfix.py \
   src/eval_mdn.py src/diagnose_memory_postfix.py \
   scripts/runpod_setup.sh data/continuous_2M
 
-# Отправить (получишь код типа: 2406-final-rufus-fashion-5)
 runpodctl send runpod_package.tar.gz
 ```
 
-**НА ПОДЕ (одна команда!):**
+### On Pod
 ```bash
-cd /workspace && runpodctl receive <КОД> && tar xzf runpod_package.tar.gz && chmod +x runpod_setup.sh && ./runpod_setup.sh
+runpodctl receive <CODE> && tar xzf runpod_package.tar.gz
+
+# Training
+python src/train_mdn_postfix.py \
+  --data-dir data/continuous_2M \
+  --out-dir out/E5_experiment \
+  --seed 7 \
+  --slot-id-mode permute_per_batch \
+  --use-aux-loss \
+  --early-stop --patience 800 \
+  --batch-size 512 --use-amp
 ```
 
-**СКАЧАТЬ РЕЗУЛЬТАТЫ:**
+### Download Results
 ```bash
-# На поде:
-tar czf results.tar.gz out/ reports/ && runpodctl send results.tar.gz
+# On pod:
+tar czf results.tar.gz out/E5_experiment/ && runpodctl send results.tar.gz
 
-# На маке:
-runpodctl receive <КОД>
+# On Mac:
+runpodctl receive <CODE>
 tar xzf results.tar.gz
 ```
 
-### Проблемы с Web Terminal / Jupyter
+### GPU Selection
+```
+DEFAULT: L40S @ $0.86/hr (48GB, ML-optimized, high availability)
+BUDGET:  A40 @ $0.40/hr (48GB, best $/perf)
+FAST:    H100 @ $2.69/hr (80GB, 2.5x speed)
+```
 
-**ИЗВЕСТНЫЙ БАГ RUNPOD!** Веб-терминал и Jupyter часто не работают:
-- После рестарта пода веб-терминал может не запуститься
-- Jupyter показывает 502 Bad Gateway
-- Терминал в Jupyter пустой/не печатает
+---
 
-**РЕШЕНИЯ:**
-1. **Используй SSH вместо веб-терминала** (надежнее):
+## ⚙️ E4 Training Flags Reference
+
+```bash
+python src/train_mdn_postfix.py \
+  --data-dir data/continuous_2M \      # INPUT: always this!
+  --out-dir out/experiment_name \      # OUTPUT: temporary
+  --seed 7 \                           # Seed (7 worked best)
+  --slot-id-mode permute_per_batch \   # ID-detox (E4)
+  --content-mode normal \              # or zeroed
+  --use-aux-loss \                     # Q3-proxy supervision
+  --early-stop --patience 800 \        # Early stopping
+  --batch-size 512 \                   # 512 for 48GB GPU
+  --use-amp                            # Mixed precision
+```
+
+---
+
+## 🔬 Diagnostics Metrics
+
+### A-K метрики в diagnose_memory_postfix.py:
+```
+A) Ablation Δ      — важность слота (цель: >0.02)
+B) Slot Similarity — косинусное сходство (цель: <0.5)
+C) Grad Correlation— корреляция градиентов (цель: <0.7)
+D) Readout Weights — веса чтения (цель: uniform)
+E) Effect Entropy  — энтропия эффекта (цель: >1.5)
+F) Slot Norms      — нормы слотов
+G) Rollout Drift   — рост ошибки (цель: slope<0.5)
+H) Cross-Block CV  — distribution shift (цель: <0.3)
+I) Attention CoM   — center of mass (цель: std>10)
+J) Permutation Inc — ID-reliance (цель: <10%)
+K) Gradient Rank   — effective rank (цель: >50%)
+```
+
+---
+
+## 📊 Experiments History
+
+| ID | Architecture | Best NLL | Key Result |
+|----|--------------|----------|------------|
+| E0 | Baseline MDN | -0.25 | No memory |
+| E1 | PREFIX Memory | -0.38 | Memory decorative |
+| E2 | PREFIX Memory | -0.38 | Seed variance |
+| E3 | POSTFIX Memory | 0.304 | ID-crutch detected |
+| **E4** | **POSTFIX+ID-Detox** | **0.1942** | **ID-Detox works!** |
+
+---
+
+## ❌ COMMON MISTAKES (не делай!)
+
+1. **Не запускай из root без указания путей!**
    ```bash
-   # Proxy SSH (работает всегда, но без SCP):
-   ssh espzoobm5yxuif-64410f63@ssh.runpod.io -i ~/.ssh/id_ed25519
+   # WRONG:
+   python train_mdn_postfix.py
 
-   # Или Direct TCP (если настроен):
-   ssh -p <PORT> root@<IP> -i ~/.ssh/id_ed25519
+   # RIGHT:
+   python src/train_mdn_postfix.py --data-dir data/continuous_2M
    ```
 
-2. **Перезапусти под** - иногда веб-терминал работает только при первом запуске
+2. **Не забывай --out-dir!**
+   - Без него output пойдет в случайное место
 
-3. **Проверь шаблон пода** - только официальные шаблоны RunPod поддерживают Jupyter
+3. **Не коммить out/ !**
+   - Только checkpoints/ и results/
 
-4. **Подожди 2-3 минуты** после старта пода - иногда нужно время
+4. **После эксперимента — обнови docs/PROJECT_MAP.md!**
 
-### Установка runpodctl (один раз)
-```bash
-brew install runpod/runpodctl/runpodctl
+---
+
+## 🎓 Project Overview
+
+**nanoGPT_RH** — Neural telescope for Riemann Hypothesis spectral analysis.
+
+**Goal:** Train transformer on 2M unfolded zeta zeros to:
+1. Learn GUE-like spacing distribution
+2. Extract operator/kernel via attention
+3. Compare with Q3 formal structures
+
+**Architecture:** SpacingMDN + POSTFIX Memory Bank
+- Memory slots AFTER data (bottleneck readout)
+- ID-Detox prevents slot-ID cheating
+- Q3-proxy aux loss for supervision
+
+**Data:** Unfolded spacings with mean ≈ 1
+```
+s_n = Δ_n * log(γ_n) / (2π)
 ```
 
-### SSH Access (опционально)
-Для Direct TCP SSH, добавь ключ НА ПОДЕ:
-```bash
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo "ssh-ed25519 AAAA... твой_ключ" >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
-```
+---
 
-### GPU Selection (Jan 2026)
-
-**DEFAULT CHOICE: L40S @ $0.86/hr**
-- 48GB VRAM, Ada architecture, ML-optimized
-- High availability, datacenter drivers
-- Best balance of price/performance/availability
-
-**BUDGET: A40 @ $0.40/hr**
-- 48GB VRAM, Ampere (older but cheap)
-- Best $/performance for single jobs
-
-**PARALLEL SEEDS: RTX 6000 Ada @ $0.77/hr**
-- 48GB VRAM, can run 3 seeds @ batch=512
-
-See `docs/runpod_specs.md` for full GPU comparison.
-
-### Performance Tips
-- **L40S 48GB**: batch_size 512-1024, --use-amp
-- **H100 80GB**: batch_size 2048, --use-amp --compile
-- **A40 48GB**: batch_size 512, --use-amp
-- FlashAttention включен по умолчанию в train_mdn.py
-
-### Что делает runpod_setup.sh
-1. pip install torch numpy scipy matplotlib rich
-2. Проверка GPU
-3. train_mdn.py (20k steps, ~50 мин на H100)
-4. eval_mdn.py (метрики)
-5. train_mdn_memory.py (10k steps, ~30 мин)
-6. diagnose_memory.py (диагностика)
-
-## GPU Benchmark (2024-12-31)
-
-### Speed Comparison (SpacingMDN+Memory, 4.8M params)
-
-| GPU | $/hr | steps/s | batch | Δ per 500 steps | samples/s |
-|-----|------|---------|-------|-----------------|-----------|
-| Mac M4 Max | FREE | 1.3 | 128 | ~3.2m | 166 |
-| A40 48GB | $0.40 | 5.8 | 512 | ~1.4m | 2,969 |
-| H100 80GB | $3.69 | ~15* | 512 | ~33s* | ~7,680* |
-
-*H100 estimated based on typical 2.5x speedup over A40
-
-### Cost Analysis (20k steps)
-
-| GPU | Time | Cost | Cost/10k steps |
-|-----|------|------|----------------|
-| Mac M4 Max | ~4.3 hr | $0 | $0 |
-| A40 | ~57 min | ~$0.38 | $0.19 |
-| H100 | ~22 min | ~$1.35 | $0.68 |
-
-### Recommendation
-
-**A40 = лучший выбор по цена/производительность для наших моделей!**
-- 18x быстрее Mac по samples/sec
-- 3.5x дешевле H100 при 2.5x меньшей скорости
-- 48GB VRAM достаточно для batch_size=512
-
-Для маленьких моделей (<10M params) H100 избыточна.
+*Last updated: 2026-01-01*
