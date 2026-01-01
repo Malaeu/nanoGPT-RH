@@ -115,19 +115,29 @@ Quality check: mean(s) ≈ 1 on large blocks.
 ```bash
 # Setup environment (uv + Python 3.13)
 uv venv && source .venv/bin/activate
-uv pip install torch numpy scipy matplotlib pysr tqdm rich
+uv pip install torch numpy scipy matplotlib rich
 
-# Data prep (when scripts exist)
-python data/prepare_zeros.py --input zeros_2M.txt --output data/unfolded.pt
+# Data prep
+python scripts/prepare_continuous_2M.py --input zeros_2M.txt --output data/continuous_2M
 
-# Training
-python train.py --config config/spacing_gpt.py
+# E4 Training (POSTFIX + ID-Detox)
+python src/train_mdn_postfix.py \
+  --data-dir data/continuous_2M \
+  --out-dir out/mdn_postfix_E4_s7 \
+  --seed 7 \
+  --slot-id-mode permute_per_batch \
+  --use-aux-loss \
+  --early-stop --patience 800 \
+  --batch-size 512 --use-amp
 
 # Evaluation
-python eval.py --checkpoint out/model.pt --metrics all
+python src/eval_mdn.py --ckpt checkpoints/E4_s7_best.pt --data-dir data/continuous_2M
 
-# PySR extraction (attention → symbolic formula)
-python extract_kernel.py --checkpoint out/model.pt --output formulas/
+# Diagnostics
+python src/diagnose_memory_postfix.py \
+  --ckpt checkpoints/E4_s7_best.pt \
+  --data-dir data/continuous_2M \
+  --output-dir results/E4_s7
 ```
 
 ## Key Experiments
@@ -158,32 +168,68 @@ python extract_kernel.py --checkpoint out/model.pt --output formulas/
 - **Diagnostics only (not in loss):** Mehta/GUE distribution — use as external validator, not built-in (avoids "you forced the network" criticism)
 - **Optional soft regularizers:** penalty for too many tiny spacings (level repulsion)
 
-## File Structure (ACTUAL)
+## Repository Structure (Jan 2026)
 
 ```
 nanoGpt_RH/
-├── data/
-│   └── continuous_2M/      # 2M unfolded spacings
-│       ├── train.pt        # (7035, 256)
-│       └── val.pt          # (781, 256)
-├── docs/
-│   ├── PROJECT_MAP.md      # ГЛАВНАЯ КАРТА ПРОЕКТА ← обновляй!
-│   └── PROJECT_GUIDE.md    # детальное ТЗ
-├── train_mdn.py            # базовый SpacingMDN
-├── train_mdn_memory.py     # PREFIX memory (deprecated)
-├── train_mdn_postfix.py    # POSTFIX memory (E3, active!)
-├── eval_mdn.py             # метрики: NLL, CRPS, PIT
-├── diagnose_memory.py      # ablation, grad corr
-├── e3_summary.md           # саммари E3 эксперимента
-├── CLAUDE.md               # этот файл
-└── out/                    # checkpoints (local/RunPod)
+│
+├── 📁 src/                      # MAIN CODE
+│   ├── train_mdn.py             # Base SpacingMDN (MDNConfig, transformer)
+│   ├── train_mdn_postfix.py     # E4 POSTFIX training (ID-Detox, aux-loss)
+│   ├── train_mdn_memory.py      # PREFIX memory (deprecated)
+│   ├── eval_mdn.py              # Evaluation (NLL, CRPS, PIT)
+│   ├── diagnose_memory.py       # PREFIX diagnostics
+│   └── diagnose_memory_postfix.py # POSTFIX diagnostics (A-K metrics)
+│
+├── 📁 scripts/                  # UTILITIES
+│   ├── prepare_continuous_2M.py # Unfolding zeros → spacings
+│   ├── prepare_zeros.py         # Raw zeros processing
+│   ├── prepare_primes.py        # Prime gaps dataset
+│   └── runpod_setup.sh          # RunPod setup script
+│
+├── 📁 checkpoints/              # TRAINED MODELS (Git LFS)
+│   ├── E0_baseline_best.pt      # SpacingMDN no memory
+│   ├── E1_prefix_best.pt        # PREFIX memory (decorative)
+│   ├── E2_prefix_best.pt        # PREFIX memory (seed variance)
+│   ├── E3_postfix_s1337_best.pt # POSTFIX (ID-crutch)
+│   ├── E4_s7_best.pt            # ⭐ BEST! NLL=0.1942, ID-Detox works!
+│   └── E4_s1337_best.pt         # POSTFIX + ID-Detox (stuck seed)
+│
+├── 📁 data/                     # DATASET
+│   ├── continuous_2M/           # Main dataset
+│   │   ├── train.pt             # (7035, 256) training spacings
+│   │   ├── val.pt               # (781, 256) validation spacings
+│   │   └── meta.pt              # Dataset metadata
+│   ├── train.pt, val.pt         # Copies in root
+│   └── *_primes.pt              # Prime gaps dataset
+│
+├── 📁 docs/                     # DOCUMENTATION
+│   ├── PROJECT_MAP.md           # ⭐ MAIN PROJECT MAP (experiments, results)
+│   ├── E4_SPEC.md               # E4 specification (ID-Detox)
+│   ├── runpod_specs.md          # GPU comparison & benchmarks
+│   ├── PROJECT_GUIDE.md         # Detailed project guide
+│   └── *.md                     # Session summaries, drafts
+│
+├── 📁 results/                  # DIAGNOSTICS OUTPUT
+│   └── E4_s7/
+│       ├── postfix_diagnostics.jsonl  # Metrics JSON
+│       └── postfix_diagnostics.png    # Visualization
+│
+├── 📁 archive/                  # OLD CODE (gitignored)
+│   ├── old_training/            # Deprecated train_*.py
+│   ├── analysis/                # Old analysis scripts
+│   └── images/                  # Old PNG files
+│
+├── CLAUDE.md                    # THIS FILE
+├── README.md                    # Project readme
+└── .gitignore                   # Git ignore rules
 ```
 
-### Current Experiment: E3 POSTFIX
-- **Script:** `train_mdn_postfix.py`
-- **Architecture:** Memory AFTER data (bottleneck readout)
-- **Status:** Running on RunPod (3 seeds)
-- **Results:** +5-10% vs E2 PREFIX
+### Current Status: E4 COMPLETE ✅
+- **Best Model:** `checkpoints/E4_s7_best.pt`
+- **NLL:** 0.1942 (+36% vs E3!)
+- **ID-Detox:** Works! Perm Inc = 1.0%
+- **Next:** E5 (slot specialization) or symbolic extraction
 
 ## Q3 Integration Points
 
@@ -208,8 +254,9 @@ cd /Users/emalam/Documents/GitHub/nanoGpt_RH
 
 # Создать пакет
 tar czf runpod_package.tar.gz \
-  train_mdn.py eval_mdn.py train_mdn_memory.py diagnose_memory.py \
-  runpod_setup.sh data/continuous_2M
+  src/train_mdn.py src/train_mdn_postfix.py \
+  src/eval_mdn.py src/diagnose_memory_postfix.py \
+  scripts/runpod_setup.sh data/continuous_2M
 
 # Отправить (получишь код типа: 2406-final-rufus-fashion-5)
 runpodctl send runpod_package.tar.gz

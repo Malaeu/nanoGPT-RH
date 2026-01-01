@@ -96,44 +96,53 @@ Result: Memory becomes ESSENTIAL (true register)
 
 ---
 
-## File Map
+## Repository Structure (Jan 2026)
 
-### Core Training Scripts
-| File | Purpose | Architecture | Status |
-|------|---------|--------------|--------|
-| `train_mdn.py` | Base SpacingMDN | No memory | ✅ stable |
-| `train_mdn_memory.py` | PREFIX memory | E1/E2 | ✅ deprecated |
-| `train_mdn_postfix.py` | **POSTFIX memory** | **E3/E4** | ✅ active (E4 flags added) |
-
-### E4 New Features in train_mdn_postfix.py
-- `--slot-id-mode fixed|off|permute_per_batch` (ID-detox)
-- `--content-mode normal|zeroed` (sanity tests)
-- `--use-aux-loss` (Q3-proxy supervision)
-- `--early-stop --patience 800` (early stopping)
-
-### Evaluation & Diagnostics
-| File | Purpose | Status |
-|------|---------|--------|
-| `eval_mdn.py` | NLL, CRPS, PIT metrics | ✅ works |
-| `diagnose_memory.py` | Ablation, grad corr (PREFIX) | ✅ for E1/E2 |
-| `diagnose_memory_postfix.py` | Ablation, grad corr (POSTFIX) | ✅ NEW for E3 |
-| `test_slot_effect.py` | Per-slot ablation | ⚠️ PREFIX only |
-
-### Data
-| Path | Contents | Shape |
-|------|----------|-------|
-| `data/continuous_2M/train.pt` | Training spacings | (7035, 256) |
-| `data/continuous_2M/val.pt` | Validation spacings | (781, 256) |
-
-### Checkpoints (RunPod)
 ```
-/workspace/out/
-├── mdn_postfix_E3_s1337/
-│   ├── best.pt
-│   ├── train.log
-│   └── memory_diagnostics.pt
-├── mdn_postfix_E3_s42/
-└── mdn_postfix_E3_s7/
+nanoGpt_RH/
+├── 📁 src/                      # MAIN CODE
+│   ├── train_mdn.py             # Base SpacingMDN (MDNConfig)
+│   ├── train_mdn_postfix.py     # ⭐ E4 training (ID-Detox, aux-loss)
+│   ├── train_mdn_memory.py      # PREFIX memory (deprecated)
+│   ├── eval_mdn.py              # Evaluation (NLL, CRPS, PIT)
+│   ├── diagnose_memory.py       # PREFIX diagnostics
+│   └── diagnose_memory_postfix.py # ⭐ POSTFIX diagnostics (A-K)
+│
+├── 📁 scripts/                  # UTILITIES
+│   ├── prepare_continuous_2M.py # Unfolding zeros → spacings
+│   ├── prepare_zeros.py         # Raw zeros processing
+│   ├── prepare_primes.py        # Prime gaps dataset
+│   └── runpod_setup.sh          # RunPod setup script
+│
+├── 📁 checkpoints/              # TRAINED MODELS (Git LFS)
+│   ├── E0_baseline_best.pt      # SpacingMDN no memory
+│   ├── E1_prefix_best.pt        # PREFIX (decorative)
+│   ├── E2_prefix_best.pt        # PREFIX (seed variance)
+│   ├── E3_postfix_s1337_best.pt # POSTFIX (ID-crutch)
+│   ├── E4_s7_best.pt            # ⭐ BEST! NLL=0.1942
+│   └── E4_s1337_best.pt         # E4 (stuck seed)
+│
+├── 📁 data/                     # DATASET
+│   └── continuous_2M/           # (7035, 256) train, (781, 256) val
+│
+├── 📁 docs/                     # DOCUMENTATION
+│   ├── PROJECT_MAP.md           # ⭐ THIS FILE
+│   ├── E4_SPEC.md               # E4 specification
+│   └── runpod_specs.md          # GPU comparison
+│
+├── 📁 results/                  # DIAGNOSTICS OUTPUT
+│   └── E4_s7/                   # jsonl + png
+│
+└── 📁 archive/                  # OLD CODE (gitignored)
+```
+
+### E4 Training Flags
+```bash
+python src/train_mdn_postfix.py \
+  --slot-id-mode permute_per_batch  # ID-detox
+  --content-mode normal             # or zeroed
+  --use-aux-loss                    # Q3-proxy supervision
+  --early-stop --patience 800       # early stopping
 ```
 
 ---
