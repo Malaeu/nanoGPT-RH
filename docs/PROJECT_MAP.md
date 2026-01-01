@@ -123,17 +123,25 @@ Result: Memory becomes ESSENTIAL (true register)
 - [ ] Norm cap (slots don't dominate)
 
 ### Extended Diagnostics ✅ (diagnose_memory_postfix.py)
-- [x] Val NLL
-- [x] Readout weights visualization
-- [x] Slot norms visualization
-- [x] Timing summary
-- [x] Ablation study (slot_off)
-- [x] Gradient correlation
-- [x] Slot similarity matrix
-- [x] Slot effect norm
-- [ ] CRPS metric (in eval_mdn.py)
-- [ ] PIT calibration (in eval_mdn.py)
-- [ ] Rollout Err@h (in eval_mdn.py)
+
+**Core Metrics (A-F):**
+- [x] A) Ablation study (slot_off → NLL delta)
+- [x] B) Slot similarity matrix
+- [x] C) Gradient correlation between slots
+- [x] D) Readout weights visualization
+- [x] E) Slot effect norm (entropy)
+- [x] F) Slot norms visualization
+
+**Extended Metrics (G-K):**
+- [x] G) Rollout Drift (Err@h horizons + error_growth_slope)
+- [x] H) Cross-Block Test (distribution shift detection)
+- [x] I) Slot Attention Profile (CoM, receptive field)
+- [x] J) Permutation Sanity (slot-ID reliance test)
+- [x] K) Gradient Rank/PCA (effective dimensionality)
+
+**In eval_mdn.py:**
+- [ ] CRPS metric
+- [ ] PIT calibration
 
 ---
 
@@ -158,6 +166,25 @@ Result: Memory becomes ESSENTIAL (true register)
 - **Results:** s7 leading with -0.3286 (+14.4% vs E2!)
 - **Created:** `diagnose_memory_postfix.py` for POSTFIX diagnostics
 - **Next:** Run diagnostics when training completes
+
+### 2026-01-01: Extended Diagnostics G-K
+- **Goal:** Distinguish "seed variance luck" from "architecture found real law"
+- **Added:** G) Rollout Drift, H) Cross-Block, I) Attention Profile, J) Permutation, K) Gradient Rank
+- **Key tests:**
+  - G) Error growth slope < 0.5 → stable predictions
+  - H) Cross-block CV < 0.1 → no distribution shift
+  - I) CoM std > 10 → slots specialize to different positions
+  - J) Permutation NLL increase < 5% → not relying on slot-ID
+  - K) rank_ratio > 0.5 → slots learn independently
+
+### 2026-01-01: Bug Fixes in diagnose_memory_postfix.py
+- **Fixed:** Unified sampler `sample_xy()` — no more (x,y) misalignment
+- **Fixed:** MDNConfig import from `train_mdn.py`
+- **Fixed:** JSONL keys (`blocks`, `slot_profiles`)
+- **Fixed:** 2D data handling in rollout/cross_block (`s = data.flatten()`)
+- **Fixed:** Permutation test wrapped in `torch.no_grad()`
+- **Added:** `--attn-layers last|mean3|meanAll` for stable attention profile
+- **Added:** `--ckpt-glob` for automatic seed aggregation with mean±std table
 
 ---
 
