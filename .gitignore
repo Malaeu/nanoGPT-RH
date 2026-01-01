@@ -8,18 +8,15 @@ __pycache__/
 venv/
 ENV/
 
-# Data (raw zeros - too large)
-data_shuffled/
-zeros/
-
-# Temporary model outputs (use checkpoints/ for final models)
+# Temporary outputs (use checkpoints/ for final models)
 out/
-out_*/
-outputs/
+archive/
 
-# Keep these in git:
-# - checkpoints/  (final best.pt files)
-# - data/continuous_2M/  (prepared dataset ~8MB)
+# Temporary files
+*.tar.gz
+*.zip
+*.log
+*.npz
 
 # Julia (PySR)
 .julia/
@@ -37,5 +34,10 @@ julia_env/
 .vscode/
 .idea/
 
-# Logs
-*.log
+# Keep in git:
+# - src/           (main code)
+# - scripts/       (utilities)
+# - checkpoints/   (final models)
+# - data/          (prepared dataset)
+# - docs/          (documentation)
+# - results/       (diagnostics)

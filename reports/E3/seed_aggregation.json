@@ -1,0 +1,32 @@
+[
+  {
+    "seed": "1337",
+    "ckpt": "out/mdn_postfix_E3_s1337/best.pt",
+    "val_nll": 0.394429087638855,
+    "max_ablation_delta": -0.013051897287368774,
+    "mean_grad_corr": 0.2335996287455597,
+    "error_growth_slope": -0.0029551534138847644,
+    "perm_relative_increase": 1.1726762773522024,
+    "gradient_rank_ratio": 1.0
+  },
+  {
+    "seed": "42",
+    "ckpt": "out/mdn_postfix_E3_s42/best.pt",
+    "val_nll": 0.3401034474372864,
+    "max_ablation_delta": 0.004649430513381958,
+    "mean_grad_corr": 0.25304862698400327,
+    "error_growth_slope": 0.017359985871244883,
+    "perm_relative_increase": 0.1307118712305359,
+    "gradient_rank_ratio": 1.875
+  },
+  {
+    "seed": "7",
+    "ckpt": "out/mdn_postfix_E3_s7/best.pt",
+    "val_nll": 0.30382364988327026,
+    "max_ablation_delta": 0.03511005640029907,
+    "mean_grad_corr": 0.4165653933098271,
+    "error_growth_slope": 0.0417686073888298,
+    "perm_relative_increase": 0.9340147750492163,
+    "gradient_rank_ratio": 1.375
+  }
+]
