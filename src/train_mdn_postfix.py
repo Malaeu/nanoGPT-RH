@@ -90,7 +90,8 @@ class MemoryBankPostfix(nn.Module):
         self.content_mode = content_mode
 
         # E5.5: Separate eval mode for deterministic validation
-        self.eval_slot_id_mode = 'fixed'  # Use fixed IDs during eval by default
+        # FIX: Default to None = use same mode as training (no distribution mismatch!)
+        self.eval_slot_id_mode = None  # None = use self.slot_id_mode
         self._eval_perm_seed = None  # For reproducible multi-perm eval
 
         # Learnable memory content
@@ -115,9 +116,9 @@ class MemoryBankPostfix(nn.Module):
         else:
             memory = self.memory  # [M, D]
 
-        # E5.5: Use eval_slot_id_mode when not training
+        # E5.5: Use eval_slot_id_mode when not training (if explicitly set)
         effective_mode = self.slot_id_mode
-        if not self.training:
+        if not self.training and self.eval_slot_id_mode is not None:
             effective_mode = self.eval_slot_id_mode
 
         # Slot-ID: fixed, off, or permute_per_batch
@@ -540,17 +541,10 @@ def compute_q3_targets(x: torch.Tensor) -> torch.Tensor:
 
 def aux_loss_q3(aux_preds: torch.Tensor, x: torch.Tensor, n_memory_slots: int = 8) -> torch.Tensor:
     """
-    Compute aux loss: DIAGONAL MSE between slot predictions and Q3-proxy targets.
+    Compute aux loss: MSE between slot predictions and Q3-proxy targets.
 
-    E5 CHANGE: Each slot is responsible for ONE specific target (breaks symmetry!).
-    - Slot 0 → M0 (mean deviation)
-    - Slot 1 → M1 (entropy)
-    - Slot 2 → M2 (max|dx|)
-    - Slot 3 → M3 (quantile 0.01)
-    - Slot 4 → M4 (curvature)
-    - Slot 5 → M5 (half-window divergence)
-    - Slot 6 → M6 (high-freq energy)
-    - Slot 7 → M7 (local rigidity)
+    E4 MODE (RESTORED): Each slot predicts ALL 8 targets, then average.
+    This gives 8x more gradient signal per slot than diagonal mode.
 
     Args:
         aux_preds: [B, M, 8] predictions from memory hidden states
@@ -558,17 +552,16 @@ def aux_loss_q3(aux_preds: torch.Tensor, x: torch.Tensor, n_memory_slots: int = 
         n_memory_slots: number of memory slots (M)
 
     Returns:
-        loss: scalar MSE loss (diagonal only)
+        loss: scalar MSE loss
     """
     targets = compute_q3_targets(x)  # [B, 8]
-    B = targets.size(0)
 
-    # DIAGONAL: slot i predicts target i
-    # Extract diagonal: aux_preds[:, i, i] for i in 0..7
-    diag_preds = torch.stack([aux_preds[:, i, i] for i in range(min(n_memory_slots, 8))], dim=1)  # [B, 8]
+    # E4 MODE: Each slot should predict the same targets (they all see same data)
+    # Average predictions across slots
+    aux_preds_mean = aux_preds.mean(dim=1)  # [B, 8]
 
-    # MSE loss on diagonal only
-    loss = F.mse_loss(diag_preds, targets)
+    # MSE loss
+    loss = F.mse_loss(aux_preds_mean, targets)
 
     return loss
 
@@ -744,6 +737,10 @@ def train(args):
         content_mode=args.content_mode,
         use_aux_loss=args.use_aux_loss
     ).to(device)
+
+    # Set eval_slot_id_mode if explicitly provided (else stays None = same as training)
+    if args.eval_slot_id_mode is not None:
+        model.memory_bank.eval_slot_id_mode = args.eval_slot_id_mode
 
     # Optimizer with separate LR for memory
     if args.memory_lr_mult < 1.0:
@@ -1066,6 +1063,9 @@ def main():
     parser.add_argument('--content-mode', type=str, default='normal',
                        choices=['normal', 'zeroed'],
                        help='Memory content mode: normal, zeroed (ID-only test)')
+    parser.add_argument('--eval-slot-id-mode', type=str, default=None,
+                       choices=['fixed', 'off', 'permute_per_batch'],
+                       help='Slot-ID mode during eval. Default=same as --slot-id-mode')
 
     # E4: Aux loss
     parser.add_argument('--use-aux-loss', action='store_true', default=False,

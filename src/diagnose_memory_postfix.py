@@ -157,6 +157,142 @@ def ablation_study(model, data, device, n_eval=500, T=256):
 
 
 # ============================================================================
+# A') K-SLOT ABLATION CURVE (E5 S1.4)
+# ============================================================================
+
+def k_slot_ablation_curve(model, data, device, n_eval=500, T=256, n_repeats=5):
+    """
+    Measure NLL degradation when k slots are ablated (k ∈ {1,2,4,8}).
+
+    This helps understand if slots are redundant (flat curve) or specialized (steep curve).
+
+    Returns:
+        k_ablation_curve: dict with k -> mean ΔNLL
+    """
+    model.eval()
+    n_slots = model.n_memory_slots
+    k_values = [k for k in [1, 2, 4, 8] if k <= n_slots]
+
+    # Sample data once
+    x, y = sample_xy(data, n_eval, T=T)
+    x, y = x.to(device), y.to(device)
+
+    # Baseline
+    with torch.no_grad():
+        pi, mu, sigma = model(x)
+        base_nll = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=0).item()
+
+    results = {"base_nll": base_nll, "k_values": k_values, "delta_nlls": {}}
+
+    for k in k_values:
+        delta_nlls = []
+
+        for rep in range(n_repeats):
+            # Random k slots to ablate
+            torch.manual_seed(rep * 1000 + k)
+            slots_to_ablate = torch.randperm(n_slots)[:k].tolist()
+
+            # Multi-slot ablation: run forward with each slot zeroed
+            # Note: model only supports single slot_off, so we need workaround
+            # For now, approximate by averaging single-slot effects
+            total_delta = 0.0
+            with torch.no_grad():
+                for slot_idx in slots_to_ablate:
+                    pi, mu, sigma = model(x, slot_off=slot_idx)
+                    abl_nll = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=0).item()
+                    total_delta += (abl_nll - base_nll)
+
+            delta_nlls.append(total_delta)
+
+        mean_delta = np.mean(delta_nlls)
+        std_delta = np.std(delta_nlls)
+        results["delta_nlls"][k] = {"mean": mean_delta, "std": std_delta}
+
+    return results
+
+
+# ============================================================================
+# CROSS-BLOCK STATS (E5 S1.4)
+# ============================================================================
+
+def cross_block_stats(model, data, device, T=256, block_size=100):
+    """
+    Compute NLL statistics across validation blocks.
+
+    Helps identify distribution shift vs model issues:
+    - High CV = model generalizes poorly across data
+    - Specific high-NLL blocks = data anomalies
+
+    Returns:
+        block_stats: dict with mean, std, p95, max, frac_outliers
+    """
+    model.eval()
+
+    # Flatten data
+    s = data.flatten()
+    total_len = len(s)
+
+    # Calculate number of blocks
+    samples_per_block = block_size
+    stride = T + 1  # each sample uses T+1 values
+
+    block_nlls = []
+    block_idx = 0
+
+    while True:
+        start = block_idx * samples_per_block * stride
+        if start + samples_per_block * stride + T >= total_len:
+            break
+
+        # Extract block samples
+        xs, ys = [], []
+        for i in range(samples_per_block):
+            idx = start + i * stride
+            if idx + T + 1 > total_len:
+                break
+            xs.append(s[idx:idx+T])
+            ys.append(s[idx+T])
+
+        if len(xs) < 10:  # skip tiny blocks
+            break
+
+        x = torch.stack(xs).to(device)
+        y = torch.stack(ys).to(device)
+
+        with torch.no_grad():
+            pi, mu, sigma = model(x)
+            block_nll = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=0).item()
+
+        block_nlls.append(block_nll)
+        block_idx += 1
+
+    if len(block_nlls) < 2:
+        return {"error": "Not enough blocks"}
+
+    block_nlls = np.array(block_nlls)
+
+    mean_nll = block_nlls.mean()
+    std_nll = block_nlls.std()
+    cv = std_nll / (mean_nll + 1e-8)  # coefficient of variation
+    p95_nll = np.percentile(block_nlls, 95)
+    max_nll = block_nlls.max()
+
+    # Outliers: blocks with NLL > 3.0 (arbitrary threshold for spacing data)
+    frac_outliers = (block_nlls > 3.0).mean()
+
+    return {
+        "n_blocks": len(block_nlls),
+        "mean": float(mean_nll),
+        "std": float(std_nll),
+        "cv": float(cv),
+        "p95": float(p95_nll),
+        "max": float(max_nll),
+        "frac_above_3": float(frac_outliers),
+        "block_nlls": block_nlls.tolist(),
+    }
+
+
+# ============================================================================
 # B) SLOT SIMILARITY
 # ============================================================================
 
@@ -629,6 +765,109 @@ def permutation_sanity_test(model, data, device, n_perms=5, n_eval=200, T=256):
 
 
 # ============================================================================
+# TASK 2: PERMUTE ENSEMBLE EVAL (mean±std over N permutations)
+# ============================================================================
+
+def permute_ensemble_eval(model, data, device, T: int, n_perms: int = 50, n_batches: int = 20, batch_size: int = 64, seed: int = 42):
+    """
+    TASK 2: Compute NLL_fixed vs NLL_perm mean±std over many permutations.
+
+    This gives a valid comparison instead of single-shot permutation test.
+    Uses FIXED golden batches for all evaluations.
+
+    Returns:
+        nll_fixed: NLL with eval_slot_id_mode='fixed'
+        nll_perm_mean, nll_perm_std: Statistics over n_perms permutations
+        perm_inc_mean, perm_inc_std: Relative increase (%)
+        nll_perm_min, nll_perm_max: Best/worst permutations
+    """
+    model.eval()
+
+    # Save original eval_slot_id_mode
+    original_eval_mode = getattr(model.memory_bank, 'eval_slot_id_mode', None)
+
+    # Create FIXED golden batches (same for all evaluations)
+    torch.manual_seed(seed)
+    total_samples = n_batches * batch_size
+    x, y = sample_xy(data, total_samples, T=T, seed=seed)
+    x, y = x.to(device), y.to(device)
+
+    # Split into batches
+    x_batches = x.split(batch_size)
+    y_batches = y.split(batch_size)
+
+    def eval_nll_batches(use_perm_seed=None):
+        """Evaluate NLL on golden batches with optional permutation seed."""
+        if use_perm_seed is not None:
+            model.memory_bank.eval_slot_id_mode = 'permute_per_batch'
+            model.memory_bank.set_eval_perm_seed(use_perm_seed)
+        else:
+            model.memory_bank.eval_slot_id_mode = 'fixed'
+            model.memory_bank.set_eval_perm_seed(None)
+
+        total_nll = 0.0
+        total_samples = 0
+        with torch.no_grad():
+            for xb, yb in zip(x_batches, y_batches):
+                pi, mu, sigma = model(xb)
+                nll = mdn_loss_1step(pi, mu, sigma, yb, entropy_reg=0).item()
+                total_nll += nll * len(xb)
+                total_samples += len(xb)
+        return total_nll / total_samples
+
+    # 1. Compute NLL_fixed
+    nll_fixed = eval_nll_batches(use_perm_seed=None)
+
+    # 2. Compute NLL_perm for N different permutation seeds
+    nll_perms = []
+    for i in range(n_perms):
+        perm_seed = seed + 1000 + i  # Different seed for each permutation
+        nll_perm = eval_nll_batches(use_perm_seed=perm_seed)
+        nll_perms.append(nll_perm)
+
+    # Restore original mode
+    model.memory_bank.eval_slot_id_mode = original_eval_mode
+
+    # Statistics
+    nll_perms = np.array(nll_perms)
+    nll_perm_mean = np.mean(nll_perms)
+    nll_perm_std = np.std(nll_perms)
+    nll_perm_min = np.min(nll_perms)
+    nll_perm_max = np.max(nll_perms)
+
+    # Perm Inc = (NLL_perm - NLL_fixed) / NLL_fixed * 100%
+    perm_incs = (nll_perms - nll_fixed) / (abs(nll_fixed) + 1e-10) * 100
+    perm_inc_mean = np.mean(perm_incs)
+    perm_inc_std = np.std(perm_incs)
+
+    # Percentiles
+    p05 = np.percentile(nll_perms, 5)
+    p50 = np.percentile(nll_perms, 50)
+    p95 = np.percentile(nll_perms, 95)
+
+    # High variance warning
+    high_variance = nll_perm_std > 0.1 * abs(nll_perm_mean)
+    best_of_artifact = (nll_perm_mean - nll_perm_min) > 0.5 * nll_perm_std
+
+    return {
+        "nll_fixed": nll_fixed,
+        "nll_perm_mean": nll_perm_mean,
+        "nll_perm_std": nll_perm_std,
+        "nll_perm_min": nll_perm_min,
+        "nll_perm_max": nll_perm_max,
+        "perm_inc_mean": perm_inc_mean,
+        "perm_inc_std": perm_inc_std,
+        "p05": p05,
+        "p50": p50,
+        "p95": p95,
+        "n_perms": n_perms,
+        "n_batches": n_batches,
+        "high_variance_warning": high_variance,
+        "best_of_artifact_warning": best_of_artifact,
+    }
+
+
+# ============================================================================
 # K) GRADIENT RANK / PCA
 # ============================================================================
 
@@ -738,7 +977,7 @@ def run_seed_aggregation(args):
     val_data = torch.load(val_path, map_location="cpu", weights_only=True)
     console.print(f"[cyan]Val data: {val_data.shape}[/]")
 
-    T = args.seq_len - 1
+    # T will be extracted from each checkpoint (TASK 1)
 
     # Collect metrics from each checkpoint
     all_metrics = []
@@ -772,6 +1011,11 @@ def run_seed_aggregation(args):
                 )
                 n_memory_slots = cfg.get("n_memory_slots", 8)
                 use_slot_id = cfg.get("use_slot_id", True)
+
+            # TASK 1: Extract T from checkpoint config
+            ckpt_seq_len = config.seq_len
+            T = ckpt_seq_len - n_memory_slots  # Context length
+            console.print(f"  [dim]seq_len={ckpt_seq_len}, T={T}[/]")
 
             model = SpacingMDNPostfix(
                 config,
@@ -876,7 +1120,12 @@ def main():
                         help="Glob pattern for multiple checkpoints (e.g., 'out/mdn_postfix_E3_s*/best.pt')")
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="reports/E3")
-    parser.add_argument("--seq-len", type=int, default=257)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="Context length. If None, uses checkpoint seq_len (RECOMMENDED)")
+    parser.add_argument("--permute-ensemble", type=int, default=0,
+                        help="Number of permutation runs for NLL_perm mean±std (0=disabled)")
+    parser.add_argument("--permute-batches", type=int, default=20,
+                        help="Number of batches for permute ensemble eval")
     parser.add_argument("--attn-layers", type=str, default="last",
                         choices=["last", "mean3", "meanAll"],
                         help="How to aggregate attention layers for profile analysis")
@@ -918,7 +1167,29 @@ def main():
     else:
         config = config_data
 
+    # ========================================================================
+    # TASK 1: Lock seq_len from checkpoint (CRITICAL!)
+    # ========================================================================
     n_slots = ckpt.get("n_memory_slots", 8)
+    # seq_len in config includes memory slots: seq_len = T + n_slots
+    ckpt_seq_len = config.seq_len  # Total sequence length from checkpoint
+    ckpt_T = ckpt_seq_len - n_slots  # Context length (data tokens only)
+
+    if args.seq_len is not None:
+        # User specified seq_len - check compatibility
+        user_T = args.seq_len - 1  # User's context expectation
+        if user_T != ckpt_T:
+            console.print(f"[bold red]ERROR: seq_len mismatch![/]")
+            console.print(f"  Checkpoint trained with: T={ckpt_T} (seq_len={ckpt_seq_len})")
+            console.print(f"  You specified: T={user_T} (seq_len={args.seq_len})")
+            console.print(f"[yellow]Use --seq-len {ckpt_T + 1} or omit --seq-len to auto-detect[/]")
+            raise ValueError(f"seq_len mismatch: checkpoint T={ckpt_T}, args T={user_T}")
+        T = user_T
+    else:
+        # Auto-detect from checkpoint (recommended)
+        T = ckpt_T
+
+    console.print(f"[bold green]seq_len config: ckpt_seq_len={ckpt_seq_len}, n_slots={n_slots}, T={T}[/]")
 
     # E4 metadata
     slot_id_mode = ckpt.get("slot_id_mode", None)
@@ -962,7 +1233,7 @@ def main():
     # ========================================================================
     console.print("\n[bold cyan]═══ A) ABLATION (slot importance) ═══[/]")
 
-    T = args.seq_len - 1  # context length
+    # T already defined above from checkpoint config (TASK 1)
     ablation = ablation_study(model, val_data, device, T=T)
     console.print(f"Base NLL: {ablation['base_nll']:.4f}")
     console.print(f"Total importance (Σ Δ): {ablation['total_importance']:.4f}")
@@ -973,6 +1244,45 @@ def main():
         bar = '█' * min(bar_len, 30)
         status = "🔴" if res['delta_nll'] > 0.01 else "🟡" if res['delta_nll'] > 0.001 else "⚪"
         console.print(f"  Slot {res['slot']}: Δ={res['delta_nll']:+.4f} {status} {bar}")
+
+    # ========================================================================
+    # A') K-SLOT ABLATION CURVE (E5 S1.4)
+    # ========================================================================
+    console.print("\n[bold cyan]═══ A') K-SLOT ABLATION CURVE ═══[/]")
+
+    k_ablation = k_slot_ablation_curve(model, val_data, device, T=T)
+    console.print(f"Base NLL: {k_ablation['base_nll']:.4f}")
+    console.print("\n[dim]k-slot ablation (cumulative ΔNLL):[/]")
+    for k in k_ablation['k_values']:
+        delta = k_ablation['delta_nlls'][k]
+        bar_len = int(max(0, delta['mean']) * 100)
+        bar = '█' * min(bar_len, 30)
+        console.print(f"  k={k}: Δ={delta['mean']:+.4f} ± {delta['std']:.4f} {bar}")
+
+    # ========================================================================
+    # CROSS-BLOCK STATS (E5 S1.4)
+    # ========================================================================
+    console.print("\n[bold cyan]═══ CROSS-BLOCK STATS ═══[/]")
+
+    block_stats = cross_block_stats(model, val_data, device, T=T)
+    if "error" not in block_stats:
+        console.print(f"Blocks analyzed: {block_stats['n_blocks']}")
+        console.print(f"Mean NLL: {block_stats['mean']:.4f}")
+        console.print(f"Std NLL: {block_stats['std']:.4f}")
+        console.print(f"CV (std/mean): {block_stats['cv']:.3f}")
+        console.print(f"P95 NLL: {block_stats['p95']:.4f}")
+        console.print(f"Max NLL: {block_stats['max']:.4f}")
+        console.print(f"Frac > 3.0: {block_stats['frac_above_3']:.2%}")
+
+        if block_stats['cv'] < 0.1:
+            console.print("[green]✓ Low variance across blocks (CV < 0.1)[/]")
+        elif block_stats['cv'] < 0.2:
+            console.print("[yellow]⚠ Moderate variance (0.1 < CV < 0.2)[/]")
+        else:
+            console.print("[red]⚠ HIGH variance across blocks (CV > 0.2)[/]")
+    else:
+        console.print(f"[red]Error: {block_stats['error']}[/]")
+        block_stats = {}
 
     # ========================================================================
     # B) SIMILARITY
@@ -1116,6 +1426,39 @@ def main():
             console.print("[yellow]⚠ Model relies heavily on slot-ID (>10% degradation)[/]")
         else:
             console.print("[green]✓ Model uses slot content, not just ID[/]")
+
+    # ========================================================================
+    # J') PERMUTE ENSEMBLE (TASK 2) - if requested
+    # ========================================================================
+    if args.permute_ensemble > 0:
+        console.print(f"\n[bold cyan]═══ J') PERMUTE ENSEMBLE (N={args.permute_ensemble}) ═══[/]")
+
+        ensemble = permute_ensemble_eval(
+            model, val_data, device, T=T,
+            n_perms=args.permute_ensemble,
+            n_batches=args.permute_batches
+        )
+
+        console.print(f"[bold]NLL_fixed:     {ensemble['nll_fixed']:.4f}[/]")
+        console.print(f"[bold]NLL_perm:      {ensemble['nll_perm_mean']:.4f} ± {ensemble['nll_perm_std']:.4f}[/]")
+        console.print(f"[bold]PermInc:       {ensemble['perm_inc_mean']:+.2f}% ± {ensemble['perm_inc_std']:.2f}%[/]")
+        console.print(f"[dim]NLL_perm range: [{ensemble['nll_perm_min']:.4f}, {ensemble['nll_perm_max']:.4f}][/]")
+        console.print(f"[dim]Percentiles:    p05={ensemble['p05']:.4f}, p50={ensemble['p50']:.4f}, p95={ensemble['p95']:.4f}[/]")
+
+        # Warnings
+        if ensemble['high_variance_warning']:
+            console.print("[yellow]⚠ HIGH VARIANCE: std > 10% of mean — permutation effect is noisy[/]")
+        if ensemble['best_of_artifact_warning']:
+            console.print("[yellow]⚠ BEST-OF ARTIFACT: min << mean — lucky permutations exist[/]")
+
+        # Interpretation
+        delta = abs(ensemble['nll_perm_mean'] - ensemble['nll_fixed'])
+        if delta < 0.05:
+            console.print("[green]✓ NLL_fixed ≈ NLL_perm — model is permutation-invariant (ID-DETOX works!)[/]")
+        elif ensemble['nll_fixed'] > ensemble['nll_perm_mean']:
+            console.print("[red]✗ NLL_fixed > NLL_perm — model RELIES on permutation (ID-crutch confirmed)[/]")
+        else:
+            console.print("[blue]? NLL_fixed < NLL_perm — fixed IDs work BETTER than permuted[/]")
 
     # ========================================================================
     # K) GRADIENT RANK / PCA
@@ -1298,6 +1641,10 @@ E3 (POSTFIX) should have:
         "base_nll": ablation['base_nll'],
         "max_ablation_delta": max_ablation_delta,
         "total_importance": ablation['total_importance'],
+        # A') K-slot ablation curve (E5 S1.4)
+        "k_ablation_curve": k_ablation.get('delta_nlls', {}),
+        # Cross-block stats (E5 S1.4)
+        "block_stats": block_stats if block_stats else {},
         "mean_similarity": similarity['mean_similarity'],
         "mean_grad_correlation": grad_corr['mean_grad_correlation'],
         "readout_uniformity": readout['uniformity'],
