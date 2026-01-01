@@ -2,6 +2,12 @@
 """
 train_mdn_postfix.py — POSTFIX Memory + Memory-Only Readout (Bottleneck)
 
+E3 → E4 UPGRADE:
+- slot_id_mode: fixed | off | permute_per_batch (ID-detox)
+- memory_content_mode: normal | zeroed (sanity tests)
+- aux_loss: Q3-proxy supervision on memory hidden states
+- early_stop: patience-based stopping
+
 KEY INSIGHT: PREFIX memory (E1/E2) is "blind" to data due to causal mask.
 POSTFIX solves this: memory slots are AFTER data, so they CAN attend to all data.
 Plus, readout only from memory creates a true BOTTLENECK.
@@ -19,7 +25,12 @@ Expected improvements after POSTFIX:
 - Slots become TRUE "registers of window state"
 
 Run:
+  # E3 mode (backward compatible)
   python train_mdn_postfix.py --data-dir data/continuous_2M --out-dir out/mdn_postfix_E3
+
+  # E4 mode (ID-detox + aux-loss)
+  python train_mdn_postfix.py --data-dir data/continuous_2M --out-dir out/mdn_postfix_E4 \\
+      --slot-id-mode permute_per_batch --use-aux-loss --early-stop --patience 800
 """
 
 import math
@@ -63,32 +74,49 @@ class MemoryBankPostfix(nn.Module):
     - Data CANNOT see memory (memory is to the right = "future")
 
     This makes memory a true "compression register" of the window.
+
+    E4 additions:
+    - slot_id_mode: 'fixed' (default), 'off' (no IDs), 'permute_per_batch' (shuffle IDs)
+    - content_mode: 'normal' (default), 'zeroed' (content=0, ID-only test)
     """
 
-    def __init__(self, n_slots: int, n_embd: int, use_slot_id: bool = True):
+    def __init__(self, n_slots: int, n_embd: int,
+                 slot_id_mode: str = 'fixed',
+                 content_mode: str = 'normal'):
         super().__init__()
         self.n_slots = n_slots
         self.n_embd = n_embd
-        self.use_slot_id = use_slot_id
+        self.slot_id_mode = slot_id_mode
+        self.content_mode = content_mode
 
         # Learnable memory content
         self.memory = nn.Parameter(torch.randn(n_slots, n_embd) * 0.02)
 
-        # Slot-ID embeddings (optional, but helps differentiation)
-        if use_slot_id:
-            self.slot_id = nn.Embedding(n_slots, n_embd)
-            nn.init.orthogonal_(self.slot_id.weight)
+        # Slot-ID embeddings (always create, but may not use)
+        self.slot_id = nn.Embedding(n_slots, n_embd)
+        nn.init.orthogonal_(self.slot_id.weight)
 
         # Learnable readout weights for pooling memory outputs
         self.readout_weights = nn.Parameter(torch.zeros(n_slots))
 
     def forward(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Return memory tokens expanded for batch: [B, M, D]"""
-        memory = self.memory  # [M, D]
+        # Content: normal or zeroed
+        if self.content_mode == 'zeroed':
+            memory = torch.zeros(self.n_slots, self.n_embd, device=device)
+        else:
+            memory = self.memory  # [M, D]
 
-        if self.use_slot_id:
+        # Slot-ID: fixed, off, or permute_per_batch
+        if self.slot_id_mode == 'fixed':
             slot_ids = torch.arange(self.n_slots, device=device)
             memory = memory + self.slot_id(slot_ids)
+        elif self.slot_id_mode == 'permute_per_batch':
+            # Random permutation per batch (breaks ID reliance during training)
+            perm = torch.randperm(self.n_slots, device=device)
+            slot_ids = perm
+            memory = memory + self.slot_id(slot_ids)
+        # else: slot_id_mode == 'off' → no ID added
 
         return memory.unsqueeze(0).expand(batch_size, -1, -1)  # [B, M, D]
 
@@ -122,17 +150,30 @@ class SpacingMDNPostfix(nn.Module):
     - Memory appended AFTER data: [data..., memory...]
     - Prediction comes ONLY from memory hidden states (bottleneck)
     - MDN predicts single next spacing s_{T+1}
+
+    E4 additions:
+    - slot_id_mode: controls slot-ID embeddings
+    - content_mode: controls memory content (for sanity tests)
+    - aux_head: optional Q3-proxy supervision
     """
 
     def __init__(self, config: MDNConfig, n_memory_slots: int = 8,
-                 use_slot_id: bool = True):
+                 slot_id_mode: str = 'fixed',
+                 content_mode: str = 'normal',
+                 use_aux_loss: bool = False):
         super().__init__()
         self.config = config
         self.n_memory_slots = n_memory_slots
-        self.use_slot_id = use_slot_id
+        self.slot_id_mode = slot_id_mode
+        self.content_mode = content_mode
+        self.use_aux_loss = use_aux_loss
 
-        # Memory bank (POSTFIX)
-        self.memory_bank = MemoryBankPostfix(n_memory_slots, config.n_embd, use_slot_id)
+        # Memory bank (POSTFIX) with E4 modes
+        self.memory_bank = MemoryBankPostfix(
+            n_memory_slots, config.n_embd,
+            slot_id_mode=slot_id_mode,
+            content_mode=content_mode
+        )
 
         # Input projection: spacing scalar -> embedding
         self.input_proj = nn.Linear(1, config.n_embd)
@@ -151,6 +192,14 @@ class SpacingMDNPostfix(nn.Module):
         # Input: pooled memory [B, D], output: [B, 1, K] for pi/mu/sigma
         self.mdn_head = MDNHead(config.n_embd, config.n_components)
 
+        # Aux head for Q3-proxy supervision (E4)
+        # Predicts 8 statistics (M0..M7) from each memory slot
+        if use_aux_loss:
+            self.aux_head = nn.Linear(config.n_embd, 8)  # [M, D] → [M, 8]
+            console.print(f"[yellow]  Aux loss: Q3-proxy supervision enabled[/]")
+        else:
+            self.aux_head = None
+
         # Init weights
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -161,6 +210,8 @@ class SpacingMDNPostfix(nn.Module):
         console.print(f"[green]SpacingMDN+POSTFIX: {n_params/1e6:.2f}M parameters[/]")
         console.print(f"[dim]  Memory slots: {n_memory_slots} (POSTFIX)[/]")
         console.print(f"[dim]  Readout: memory-only bottleneck[/]")
+        console.print(f"[dim]  slot_id_mode: {slot_id_mode}[/]")
+        console.print(f"[dim]  content_mode: {content_mode}[/]")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -172,16 +223,19 @@ class SpacingMDNPostfix(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 return_attention: bool = False,
+                return_aux: bool = False,
                 slot_off: Optional[int] = None) -> Tuple:
         """
         Args:
             x: [B, T] continuous spacing values (window)
             return_attention: return attention weights for analysis
+            return_aux: return aux predictions from memory hidden states
             slot_off: if not None, zero out this memory slot (for ablation)
 
         Returns:
             pi, mu, sigma: [B, 1, K] MDN parameters for next spacing
             attentions: list of attention weights if return_attention=True
+            aux_preds: [B, M, 8] aux predictions if return_aux=True
         """
         B, T = x.size()
         device = x.device
@@ -229,8 +283,18 @@ class SpacingMDNPostfix(nn.Module):
         readout = readout.unsqueeze(1)  # [B, 1, D]
         pi, mu, sigma = self.mdn_head(readout)  # each [B, 1, K]
 
-        if return_attention:
+        # Aux predictions from memory hidden states
+        aux_preds = None
+        if return_aux and self.aux_head is not None:
+            aux_preds = self.aux_head(memory_hidden)  # [B, M, 8]
+
+        # Return based on what's requested
+        if return_attention and return_aux:
+            return pi, mu, sigma, attentions, aux_preds
+        elif return_attention:
             return pi, mu, sigma, attentions
+        elif return_aux:
+            return pi, mu, sigma, aux_preds
         return pi, mu, sigma
 
     def get_memory_param_groups(self, base_lr: float, memory_lr_mult: float = 0.3):
@@ -335,12 +399,134 @@ def mdn_loss_1step(pi: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor,
 
 
 # ============================================================================
+# Q3-PROXY TARGETS (E4)
+# ============================================================================
+
+def compute_q3_targets(x: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Q3-proxy statistics for aux supervision.
+
+    Args:
+        x: [B, T] spacing window
+
+    Returns:
+        targets: [B, 8] z-score normalized statistics (M0..M7)
+    """
+    B, T = x.size()
+    device = x.device
+
+    # M0: mean(x) - 1.0 (T0 normalization, should be ~0)
+    m0 = x.mean(dim=1) - 1.0
+
+    # M1: hist_entropy (A1' coverage) - entropy of histogram
+    # Approximate with variance-based entropy
+    std = x.std(dim=1) + 1e-8
+    m1 = torch.log(std * np.sqrt(2 * np.pi * np.e))
+
+    # M2: max|dx| (A2 Lipschitz bound)
+    dx = x[:, 1:] - x[:, :-1]
+    m2 = dx.abs().max(dim=1).values
+
+    # M3: quantile 0.01 (A3 floor)
+    m3 = torch.quantile(x, 0.01, dim=1)
+
+    # M4: mean|d²x| (smoothness / curvature)
+    d2x = dx[:, 1:] - dx[:, :-1]
+    m4 = d2x.abs().mean(dim=1)
+
+    # M5: half_window_divergence (Toeplitz symmetry)
+    half = T // 2
+    left_mean = x[:, :half].mean(dim=1)
+    right_mean = x[:, half:].mean(dim=1)
+    m5 = (left_mean - right_mean).abs()
+
+    # M6: high_freq_energy (RKHS cap) - energy in high-freq components
+    # Use second derivative as proxy for high-frequency
+    m6 = (d2x ** 2).mean(dim=1)
+
+    # M7: local_rigidity (Δ3-proxy) - variance of local variance
+    # Window of 16 positions
+    window = 16
+    n_windows = T // window
+    if n_windows > 1:
+        x_reshaped = x[:, :n_windows * window].view(B, n_windows, window)
+        local_vars = x_reshaped.var(dim=2)  # [B, n_windows]
+        m7 = local_vars.var(dim=1)  # variance of local variances
+    else:
+        m7 = torch.zeros(B, device=device)
+
+    # Stack all targets
+    targets = torch.stack([m0, m1, m2, m3, m4, m5, m6, m7], dim=1)  # [B, 8]
+
+    # Z-score normalize (per batch for stability)
+    targets_mean = targets.mean(dim=0, keepdim=True)
+    targets_std = targets.std(dim=0, keepdim=True) + 1e-8
+    targets = (targets - targets_mean) / targets_std
+
+    return targets
+
+
+def aux_loss_q3(aux_preds: torch.Tensor, x: torch.Tensor, n_memory_slots: int = 8) -> torch.Tensor:
+    """
+    Compute aux loss: MSE between slot predictions and Q3-proxy targets.
+
+    Args:
+        aux_preds: [B, M, 8] predictions from memory hidden states
+        x: [B, T] input spacing window
+        n_memory_slots: number of memory slots (M)
+
+    Returns:
+        loss: scalar MSE loss
+
+    Note: Each slot predicts all 8 targets. We average across slots.
+    """
+    targets = compute_q3_targets(x)  # [B, 8]
+
+    # Each slot should predict the same targets (they all see same data)
+    # Average predictions across slots
+    aux_preds_mean = aux_preds.mean(dim=1)  # [B, 8]
+
+    # MSE loss
+    loss = F.mse_loss(aux_preds_mean, targets)
+
+    return loss
+
+
+def get_aux_weight(step: int) -> float:
+    """
+    Ramp schedule for aux weight.
+
+    Schedule:
+        step 0-500:     0 → 1e-3 (warmup)
+        step 500-3000:  1e-3 → 1e-2 (ramp up)
+        step 3000+:     1e-2 (hold)
+    """
+    if step < 500:
+        # Linear warmup 0 → 1e-3
+        return 1e-3 * (step / 500.0)
+    elif step < 3000:
+        # Linear ramp 1e-3 → 1e-2
+        progress = (step - 500) / (3000 - 500)
+        return 1e-3 + progress * (1e-2 - 1e-3)
+    else:
+        return 1e-2
+
+
+# ============================================================================
 # TRAINING
 # ============================================================================
 
 def train(args):
-    console.print(f"[bold magenta]POSTFIX Memory Training (E3)[/]")
-    console.print(f"[dim]Memory sees data, data doesn't see memory[/]\n")
+    # Determine experiment version
+    is_e4 = args.slot_id_mode != 'fixed' or args.use_aux_loss or args.early_stop
+    exp_name = "E4" if is_e4 else "E3"
+
+    console.print(f"[bold magenta]POSTFIX Memory Training ({exp_name})[/]")
+    console.print(f"[dim]Memory sees data, data doesn't see memory[/]")
+    if is_e4:
+        console.print(f"[yellow]E4 mode: slot_id_mode={args.slot_id_mode}, aux_loss={args.use_aux_loss}, early_stop={args.early_stop}[/]\n")
+    else:
+        console.print("")
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     console.print(f"[cyan]Device: {device}[/]")
@@ -403,11 +589,13 @@ def train(args):
         bias=False
     )
 
-    # Create model
+    # Create model with E4 modes
     model = SpacingMDNPostfix(
         config,
         n_memory_slots=args.n_memory_slots,
-        use_slot_id=args.use_slot_id
+        slot_id_mode=args.slot_id_mode,
+        content_mode=args.content_mode,
+        use_aux_loss=args.use_aux_loss
     ).to(device)
 
     # Optimizer with separate LR for memory
@@ -434,10 +622,15 @@ def train(args):
     best_val_nll = float('inf')
     train_iter = iter(train_loader)
 
+    # Early stopping
+    patience_counter = 0
+    early_stopped = False
+
     # Log file
     log_file = open(out_dir / 'train.log', 'w')
 
-    console.print(f"\n[bold]Starting training for {args.max_steps} steps...[/]\n")
+    max_steps_str = f"{args.max_steps}" if not args.early_stop else f"{args.max_steps} (early stop patience={args.patience})"
+    console.print(f"\n[bold]Starting training for {max_steps_str} steps...[/]\n")
 
     with Progress(
         SpinnerColumn(),
@@ -465,8 +658,15 @@ def train(args):
             # Forward pass with optional AMP
             if scaler is not None:
                 with autocast('cuda'):
-                    pi, mu, sigma = model(x)
-                    loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                    if args.use_aux_loss:
+                        pi, mu, sigma, aux_preds = model(x, return_aux=True)
+                        mdn_loss_val = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                        aux_weight = get_aux_weight(step)
+                        aux_loss_val = aux_loss_q3(aux_preds, x, args.n_memory_slots)
+                        loss = mdn_loss_val + aux_weight * aux_loss_val
+                    else:
+                        pi, mu, sigma = model(x)
+                        loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -474,8 +674,15 @@ def train(args):
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                pi, mu, sigma = model(x)
-                loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                if args.use_aux_loss:
+                    pi, mu, sigma, aux_preds = model(x, return_aux=True)
+                    mdn_loss_val = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                    aux_weight = get_aux_weight(step)
+                    aux_loss_val = aux_loss_q3(aux_preds, x, args.n_memory_slots)
+                    loss = mdn_loss_val + aux_weight * aux_loss_val
+                else:
+                    pi, mu, sigma = model(x)
+                    loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
@@ -497,27 +704,42 @@ def train(args):
 
                 val_nll = np.mean(val_losses)
 
-                # Save checkpoint
+                # Save checkpoint with E4 fields
                 ckpt = {
                     'model': model.state_dict(),
                     'config': config,
                     'n_memory_slots': args.n_memory_slots,
-                    'use_slot_id': args.use_slot_id,
+                    'slot_id_mode': args.slot_id_mode,
+                    'content_mode': args.content_mode,
+                    'use_aux_loss': args.use_aux_loss,
                     'step': step,
                     'val_nll': val_nll,
-                    'architecture': 'POSTFIX'
+                    'architecture': 'POSTFIX',
+                    'experiment': 'E4' if is_e4 else 'E3'
                 }
 
                 if val_nll < best_val_nll:
                     best_val_nll = val_nll
+                    patience_counter = 0
                     torch.save(ckpt, out_dir / 'best.pt')
+                else:
+                    patience_counter += 1
 
                 # Log
                 elapsed = time.time() - start_time
                 msg = f"Step {step}: val_nll={val_nll:.4f} (best={best_val_nll:.4f}) elapsed={elapsed/60:.1f}m"
+                if args.early_stop:
+                    msg += f" patience={patience_counter}/{args.patience}"
                 console.print(f"[dim]{msg}[/]")
                 log_file.write(msg + '\n')
                 log_file.flush()
+
+                # Early stopping check
+                if args.early_stop and patience_counter >= args.patience:
+                    console.print(f"[yellow]Early stopping triggered at step {step}[/]")
+                    log_file.write(f"Early stopping triggered at step {step}\n")
+                    early_stopped = True
+                    break
 
             # Save periodic checkpoints
             if step % args.save_every == 0:
@@ -525,12 +747,19 @@ def train(args):
                     'model': model.state_dict(),
                     'config': config,
                     'n_memory_slots': args.n_memory_slots,
-                    'use_slot_id': args.use_slot_id,
+                    'slot_id_mode': args.slot_id_mode,
+                    'content_mode': args.content_mode,
+                    'use_aux_loss': args.use_aux_loss,
                     'step': step,
                     'val_nll': val_nll if 'val_nll' in dir() else None,
-                    'architecture': 'POSTFIX'
+                    'architecture': 'POSTFIX',
+                    'experiment': 'E4' if is_e4 else 'E3'
                 }
                 torch.save(ckpt, out_dir / f'ckpt_{step}.pt')
+
+            # Check early stopping (break after saving checkpoint)
+            if early_stopped:
+                break
 
     # Final save
     total_time = time.time() - start_time
@@ -542,10 +771,14 @@ def train(args):
         'model': model.state_dict(),
         'config': config,
         'n_memory_slots': args.n_memory_slots,
-        'use_slot_id': args.use_slot_id,
+        'slot_id_mode': args.slot_id_mode,
+        'content_mode': args.content_mode,
+        'use_aux_loss': args.use_aux_loss,
         'step': step,
         'val_nll': best_val_nll,
-        'architecture': 'POSTFIX'
+        'architecture': 'POSTFIX',
+        'experiment': 'E4' if is_e4 else 'E3',
+        'early_stopped': early_stopped
     }
     torch.save(ckpt, out_dir / 'final.pt')
 
@@ -575,7 +808,7 @@ def train(args):
     # Memory Slot Norms
     console.print(f"\n[bold cyan]═══ Memory Slot Norms ═══[/]")
     mem = model.memory_bank.memory.detach().cpu()
-    if model.memory_bank.use_slot_id:
+    if model.memory_bank.slot_id_mode == 'fixed':
         slot_ids = torch.arange(args.n_memory_slots)
         mem = mem + model.memory_bank.slot_id(slot_ids).detach().cpu()
     norms = mem.norm(dim=1).numpy()
@@ -629,9 +862,26 @@ def main():
 
     # Memory
     parser.add_argument('--n-memory-slots', type=int, default=8)
-    parser.add_argument('--use-slot-id', action='store_true', default=True)
     parser.add_argument('--memory-lr-mult', type=float, default=0.3,
                        help='Memory LR multiplier (lower for stability)')
+
+    # E4: Slot-ID and Content modes
+    parser.add_argument('--slot-id-mode', type=str, default='fixed',
+                       choices=['fixed', 'off', 'permute_per_batch'],
+                       help='Slot-ID mode: fixed (E3), off, permute_per_batch (E4)')
+    parser.add_argument('--content-mode', type=str, default='normal',
+                       choices=['normal', 'zeroed'],
+                       help='Memory content mode: normal, zeroed (ID-only test)')
+
+    # E4: Aux loss
+    parser.add_argument('--use-aux-loss', action='store_true', default=False,
+                       help='Enable Q3-proxy aux loss supervision')
+
+    # E4: Early stopping
+    parser.add_argument('--early-stop', action='store_true', default=False,
+                       help='Enable early stopping')
+    parser.add_argument('--patience', type=int, default=800,
+                       help='Early stopping patience (in eval steps)')
 
     # Training
     parser.add_argument('--seq-len', type=int, default=257,

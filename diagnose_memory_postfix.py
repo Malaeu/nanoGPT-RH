@@ -166,9 +166,9 @@ def measure_slot_similarity(model):
     """
     mem = model.memory_bank.memory.detach()  # [M, D]
 
-    if model.memory_bank.use_slot_id:
+    if getattr(model.memory_bank, 'slot_id_mode', 'fixed') != 'off':
         slot_ids = torch.arange(model.n_memory_slots, device=mem.device)
-        mem = mem + model.memory_bank.slot_id(slot_ids)
+        mem = (mem + model.memory_bank.slot_id(slot_ids)).detach()
 
     # Normalize
     mem_norm = F.normalize(mem, dim=-1)
@@ -329,9 +329,9 @@ def measure_slot_norms(model):
     """Measure L2 norm of each slot embedding."""
     mem = model.memory_bank.memory.detach()  # [M, D]
 
-    if model.memory_bank.use_slot_id:
+    if getattr(model.memory_bank, 'slot_id_mode', 'fixed') != 'off':
         slot_ids = torch.arange(model.n_memory_slots, device=mem.device)
-        mem = mem + model.memory_bank.slot_id(slot_ids)
+        mem = (mem + model.memory_bank.slot_id(slot_ids)).detach()
 
     norms = mem.norm(dim=-1).cpu().numpy()
 
@@ -585,7 +585,7 @@ def permutation_sanity_test(model, data, device, n_perms=5, n_eval=200, T=256):
     """
     model.eval()
 
-    if not model.memory_bank.use_slot_id:
+    if getattr(model.memory_bank, 'slot_id_mode', 'fixed') == 'off':
         return {"skipped": True, "reason": "no slot_id embeddings"}
 
     # Use unified sampler
@@ -776,7 +776,9 @@ def run_seed_aggregation(args):
             model = SpacingMDNPostfix(
                 config,
                 n_memory_slots=n_memory_slots,
-                use_slot_id=use_slot_id,
+                slot_id_mode=ckpt.get('slot_id_mode', ('fixed' if use_slot_id else 'off')),
+                content_mode=ckpt.get('content_mode', 'normal'),
+                use_aux_loss=ckpt.get('use_aux_loss', False),
             )
             model.load_state_dict(ckpt["model"])
             model = model.to(device)
@@ -917,17 +919,28 @@ def main():
         config = config_data
 
     n_slots = ckpt.get("n_memory_slots", 8)
-    use_slot_id = ckpt.get("use_slot_id", True)
+
+    # E4 metadata
+    slot_id_mode = ckpt.get("slot_id_mode", None)
+    if slot_id_mode is None:
+        use_slot_id = ckpt.get("use_slot_id", True)
+        slot_id_mode = "fixed" if use_slot_id else "off"
+    content_mode = ckpt.get("content_mode", "normal")
+    use_aux_loss = ckpt.get("use_aux_loss", False)
 
     console.print(f"[green]  Memory slots: {n_slots}[/]")
-    console.print(f"[green]  Slot-ID: {use_slot_id}[/]")
+    console.print(f"[green]  slot_id_mode: {slot_id_mode}[/]")
+    console.print(f"[green]  content_mode: {content_mode}[/]")
+    console.print(f"[green]  aux_loss: {use_aux_loss}[/]")
     console.print(f"[green]  Architecture: {arch}[/]")
 
     # Create model
     model = SpacingMDNPostfix(
         config,
         n_memory_slots=n_slots,
-        use_slot_id=use_slot_id
+        slot_id_mode=slot_id_mode,
+        content_mode=content_mode,
+        use_aux_loss=use_aux_loss,
     ).to(device)
 
     # Load weights

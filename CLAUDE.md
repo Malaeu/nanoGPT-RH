@@ -4,6 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
+## TRAINING LOGGING RULES (КРИТИЧНО!)
+
+При запуске тренировки ВСЕГДА показывать в логах:
+
+1. **В начале тренировки:**
+   - GPU name (nvidia-smi)
+   - VRAM total / used
+   - batch_size
+   - Estimated steps/sec (после первых 100 steps)
+
+2. **Каждые N steps (eval):**
+   - Current step / total steps
+   - val_nll (и best)
+   - Elapsed time
+   - **steps/sec** (текущая скорость!)
+   - **ETA** (сколько осталось!)
+   - patience (если early-stop)
+
+3. **В конце тренировки:**
+   - Total time
+   - Total steps
+   - Final steps/sec
+   - samples/sec
+   - Cost estimate ($/hr × time)
+
+**Пример формата лога:**
+```
+Step 1000/20000 | val_nll=0.358 (best=0.358) | 5.8 steps/s | ETA: 55m | elapsed: 2.9m
+```
+
+**ЗАЧЕМ:** Чтобы сравнивать GPU и выбирать оптимальный под!
+См. `docs/runpod_specs.md` для бенчмарков.
+
+---
+
 ## DOCUMENTATION RULES (ОБЯЗАТЕЛЬНО!)
 
 ### После успешных изменений обновляй:
@@ -231,9 +266,26 @@ echo "ssh-ed25519 AAAA... твой_ключ" >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
+### GPU Selection (Jan 2026)
+
+**DEFAULT CHOICE: L40S @ $0.86/hr**
+- 48GB VRAM, Ada architecture, ML-optimized
+- High availability, datacenter drivers
+- Best balance of price/performance/availability
+
+**BUDGET: A40 @ $0.40/hr**
+- 48GB VRAM, Ampere (older but cheap)
+- Best $/performance for single jobs
+
+**PARALLEL SEEDS: RTX 6000 Ada @ $0.77/hr**
+- 48GB VRAM, can run 3 seeds @ batch=512
+
+See `docs/runpod_specs.md` for full GPU comparison.
+
 ### Performance Tips
+- **L40S 48GB**: batch_size 512-1024, --use-amp
 - **H100 80GB**: batch_size 2048, --use-amp --compile
-- **A100 40GB**: batch_size 1024, --use-amp
+- **A40 48GB**: batch_size 512, --use-amp
 - FlashAttention включен по умолчанию в train_mdn.py
 
 ### Что делает runpod_setup.sh

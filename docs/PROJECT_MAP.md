@@ -2,8 +2,8 @@
 
 > Автогенерируемая карта проекта. Обновляется после каждого значимого изменения.
 
-**Last Updated:** 2026-01-01 (auto-changelog v2)
-**Current Focus:** E3 POSTFIX Memory Experiments
+**Last Updated:** 2026-01-01 (E4 implementation)
+**Current Focus:** E4 Register Stabilization & ID-Detox
 
 ---
 
@@ -14,14 +14,53 @@
 | E0 | SpacingMDN (no memory) | ✅ completed | ~-0.25 | Baseline MDN |
 | E1 | PREFIX Memory (8 slots) | ✅ completed | -0.3793 | Memory "decorative" |
 | E2 | PREFIX Memory (8 slots) | ✅ completed | -0.3840 | Same as E1, seed variance |
-| **E3** | **POSTFIX Memory** | 🔄 running | **-0.3453** | **+10% vs E2!** |
+| E3 | POSTFIX Memory | ✅ completed | 0.304 | +14% vs E2, but ID-crutch! |
+| **E4** | **POSTFIX + ID-Detox** | ✅ **DONE** | **0.1942** | **+36% vs E3! No ID-crutch!** |
 
-### E3 Seeds Status (RunPod RTX 6000 Ada 48GB)
-| Seed | Step | Best NLL | vs E2 (-0.384) |
-|------|------|----------|----------------|
-| 1337 | 4500 | -0.3453 | +10.1% |
-| 42 | 3000 | -0.3484 | +9.3% |
-| 7 | 1000 | -0.3646 | +5.1% |
+### E3 Final Results
+| Seed | Best NLL | Ablation Δ | Grad Corr | Perm Inc | Issue |
+|------|----------|------------|-----------|----------|-------|
+| 7 | 0.304 | +0.035 | 0.417 | 93% | ID-reliance |
+| 42 | 0.340 | +0.005 | 0.253 | 117% | ID-reliance |
+| 1337 | 0.394 | -0.013 | 0.234 | 13% | Weak causality |
+
+**E3 Conclusion:** NLL improved, but Permutation test shows model relies on slot-ID embeddings.
+
+### E4 Final Results ✅ COMPLETED!
+| Seed | Best NLL | vs E3 | Steps | Status |
+|------|----------|-------|-------|--------|
+| 7 | **0.1942** | **+36%** 🏆 | 10000 | BEST |
+| 42 | 0.3294 | -8% | 7000 | stuck |
+| 1337 | 0.3431 | -13% | 9000 | stuck |
+
+**E4 Configuration:**
+- `slot_id_mode=permute_per_batch` (ID-detox)
+- `use_aux_loss=True` (Q3-proxy supervision)
+- `early_stop=True, patience=800`
+
+**E4 Conclusion:**
+- s7 achieved **0.1942** — 36% better than E3 best!
+- Model learns WITHOUT ID-crutch
+- permute_per_batch works!
+- High seed variance (only 1/3 found good minimum)
+
+### E4 s7 Diagnostics ✅
+| Metric | Value | Status | Comment |
+|--------|-------|--------|---------|
+| **NLL** | 0.1721 | ✅ | Best ever |
+| **Slot-ID Reliance** | 1.0% | ✅ **VICTORY!** | ID-Detox works! |
+| **Grad Corr** | 0.296 | ✅ | Was 0.9 in E1/E2 |
+| **Mean Slot Sim** | 0.167 | ✅ | Slots differentiated |
+| **Effect Entropy** | 1.97 | ✅ | Good distribution |
+| **Error Growth** | 0.076 | ✅ | Low drift |
+| **Max Ablation Δ** | 0.0058 | ⚠️ | Target >= 0.02 |
+| **Cross-Block CV** | 0.644 | ⚠️ | Distribution shift |
+| **CoM std** | 4.3 | ⚠️ | Slots don't specialize |
+
+**Key Finding:** ID-Detox **works**! Perm Inc dropped from 93-117% (E3) to **1.0%** (E4).
+Model uses slot **content**, not slot **ID**. This was the main E4 goal.
+
+**Remaining Issue:** Low ablation Δ means slots are redundant (robust but not specialized)
 
 ---
 
@@ -64,7 +103,13 @@ Result: Memory becomes ESSENTIAL (true register)
 |------|---------|--------------|--------|
 | `train_mdn.py` | Base SpacingMDN | No memory | ✅ stable |
 | `train_mdn_memory.py` | PREFIX memory | E1/E2 | ✅ deprecated |
-| `train_mdn_postfix.py` | **POSTFIX memory** | **E3** | ✅ active |
+| `train_mdn_postfix.py` | **POSTFIX memory** | **E3/E4** | ✅ active (E4 flags added) |
+
+### E4 New Features in train_mdn_postfix.py
+- `--slot-id-mode fixed|off|permute_per_batch` (ID-detox)
+- `--content-mode normal|zeroed` (sanity tests)
+- `--use-aux-loss` (Q3-proxy supervision)
+- `--early-stop --patience 800` (early stopping)
 
 ### Evaluation & Diagnostics
 | File | Purpose | Status |
@@ -93,9 +138,9 @@ Result: Memory becomes ESSENTIAL (true register)
 
 ---
 
-## Implementation Checklist (E3 ТЗ)
+## Implementation Checklist
 
-### Core Architecture ✅
+### E3 Core Architecture ✅
 - [x] POSTFIX layout: `[data..., memory...]`
 - [x] Memory sees data (causal mask OK)
 - [x] Data doesn't see memory (blocked)
@@ -105,20 +150,31 @@ Result: Memory becomes ESSENTIAL (true register)
 - [x] Single-step prediction (seq_len=257)
 - [x] Ablation support (slot_off param)
 
-### Q3 Aux Supervision ❌ (planned for E4)
-- [ ] `compute_q3_invariants()` function
-- [ ] M0: mean(x)-1 (T0 normalization)
-- [ ] M1: hist_entropy (A1' coverage)
-- [ ] M2: max|dx| (A2 Lipschitz)
-- [ ] M3: quantile 0.01 (A3 floor)
-- [ ] M4: mean|d²x| (smoothness)
-- [ ] M5: half_window_divergence (Toeplitz)
-- [ ] M6: high_freq_energy (RKHS cap)
-- [ ] M7: local_rigidity (spectral gap)
-- [ ] z-score normalization
-- [ ] aux_loss MSE/Huber
+### E4 ID-Detox ✅ (implemented!)
+- [x] `--slot-id-mode fixed|off|permute_per_batch`
+- [x] `--content-mode normal|zeroed`
+- [x] Permute slot-IDs per batch during training
+- [x] Zeroed content mode for ID-only test
 
-### Regularization ❌ (planned)
+### E4 Q3 Aux Supervision ✅ (implemented!)
+- [x] `compute_q3_targets()` function
+- [x] M0: mean(x)-1 (T0 normalization)
+- [x] M1: hist_entropy (A1' coverage)
+- [x] M2: max|dx| (A2 Lipschitz)
+- [x] M3: quantile 0.01 (A3 floor)
+- [x] M4: mean|d²x| (smoothness)
+- [x] M5: half_window_divergence (Toeplitz)
+- [x] M6: high_freq_energy (RKHS cap)
+- [x] M7: local_rigidity (spectral gap)
+- [x] z-score normalization
+- [x] aux_loss MSE
+- [x] Ramp schedule (0→1e-3→1e-2)
+
+### E4 Early Stopping ✅
+- [x] `--early-stop --patience 800`
+- [x] Monitor val_nll
+
+### Regularization ❌ (not planned for E4)
 - [ ] Orthogonality loss (slots don't collapse)
 - [ ] Norm cap (slots don't dominate)
 
@@ -186,6 +242,31 @@ Result: Memory becomes ESSENTIAL (true register)
 - **Added:** `--attn-layers last|mean3|meanAll` for stable attention profile
 - **Added:** `--ckpt-glob` for automatic seed aggregation with mean±std table
 
+### 2026-01-01: E4 Implementation
+- **Problem:** E3 Permutation test shows 93-117% NLL increase → ID-crutch detected
+- **Solution:** ID-Detox via `--slot-id-mode permute_per_batch`
+- **Added features:**
+  - `slot_id_mode`: fixed | off | permute_per_batch
+  - `content_mode`: normal | zeroed (sanity tests)
+  - Q3-proxy aux loss with ramp schedule
+  - Early stopping with patience
+- **Created:** `docs/E4_SPEC.md` with full specification
+- **Success criteria:**
+  - Ablation Δ >= 0.02 on 2/3 seeds
+  - ID-only test: ΔNLL >= 0.02
+  - Content-only degradation <= 30%
+
+### 2026-01-01: E4 Diagnostics Complete
+- **Result:** E4 s7 achieved NLL=0.1721 (36% better than E3!)
+- **ID-Detox:** ✅ **WORKS!** Perm Inc dropped from 93-117% → **1.0%**
+- **Partial success:**
+  - ✅ Grad Corr = 0.296 (was 0.9 in E1/E2)
+  - ✅ Effect Entropy = 1.97 (good distribution)
+  - ✅ Error Growth = 0.076 (low drift)
+  - ⚠️ Ablation Δ = 0.0058 (target was 0.02)
+  - ⚠️ Cross-Block CV = 0.644 (distribution shift)
+- **Conclusion:** Model learns from slot content, not ID. Slots are redundant (robust).
+
 ---
 
 ## Terminology
@@ -205,25 +286,45 @@ Result: Memory becomes ESSENTIAL (true register)
 ## RunPod Commands
 
 ```bash
-# Package for RunPod
-tar czf runpod_postfix.tar.gz train_mdn_postfix.py data/continuous_2M
-runpodctl send runpod_postfix.tar.gz
+# Package for RunPod (E4)
+tar czf runpod_e4.tar.gz train_mdn_postfix.py train_mdn.py data/continuous_2M
+runpodctl send runpod_e4.tar.gz
 
 # On Pod
-runpodctl receive <CODE> && tar xzf runpod_postfix.tar.gz
+runpodctl receive <CODE> && tar xzf runpod_e4.tar.gz
 pip install torch numpy scipy matplotlib rich
-python train_mdn_postfix.py --data-dir data/continuous_2M --out-dir out/mdn_postfix_E3_s1337 --seed 1337 --max-steps 20000 --batch-size 512 --use-amp
+
+# E4 Training (ID-Detox + Aux Loss)
+python train_mdn_postfix.py \
+    --data-dir data/continuous_2M \
+    --out-dir out/mdn_postfix_E4_s1337 \
+    --seed 1337 \
+    --slot-id-mode permute_per_batch \
+    --use-aux-loss \
+    --early-stop \
+    --patience 800 \
+    --batch-size 512 \
+    --use-amp
 
 # Download results
-tar czf e3_results.tar.gz out/ && runpodctl send e3_results.tar.gz
+tar czf e4_results.tar.gz out/ && runpodctl send e4_results.tar.gz
 ```
 
 ---
 
 ## Next Steps
 
-1. **Wait for E3 to complete** (~20k steps each seed)
-2. **Run diagnostics** on E3 checkpoints
-3. **Compare metrics** with E1/E2 (ablation Δ, grad corr)
-4. **If E3 successful:** Add Q3-proxy aux loss for E4
-5. **If E3 marginal:** Investigate attention patterns
+1. ✅ **E3 completed** — NLL improved but ID-crutch detected
+2. ✅ **E4 implemented** — ID-Detox + Q3-aux loss ready
+3. ✅ **E4 trained on RunPod** — s7 achieved 0.1942 (BEST!)
+4. ✅ **E4 diagnostics** — ID-Detox works! Perm Inc = 1.0%
+5. **E4 Partial Success:**
+   - ✅ ID-only: model uses content, not ID (Perm Inc 1%)
+   - ⚠️ Ablation Δ = 0.0058 < 0.02 target (slots redundant)
+   - ⚠️ Cross-block CV = 0.644 (distribution shift)
+6. **Options for E5:**
+   - A) **Slot specialization** — add orthogonality loss to force different roles
+   - B) **Slot dropout** — randomly drop slots during training
+   - C) **Block normalization** — fix distribution shift issue
+   - D) **Move to extraction** — model is good enough, start symbolic regression
+7. **Default GPU:** L40S @ $0.86/hr (ML-optimized, high availability)
