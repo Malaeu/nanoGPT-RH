@@ -34,6 +34,16 @@ DOCS:
   docs/PROJECT_MAP.md            # ⭐ Main project map
   docs/E4_SPEC.md                # E4 specification
   docs/runpod_specs.md           # GPU comparison
+  docs/SPEED_OPTIMIZATION.md     # 🚀 GPU speed tricks (Ampere+)
+
+FLASH CODE (новое):
+  src/flash/                     # Flash-оптимизированные модели
+  src/flash/mdn_flash.py         # Base SpacingMDN + RoPE
+  src/flash/memory_mdn_flash.py  # Q3 MemoryMDN
+  src/flash/train_memory_q3_flash.py  # Fast training script
+
+FLASH DATA (180M точек!):
+  src/data/flash_residuals/      # Residuals = spacings - 1.0
 ```
 
 ---
@@ -191,6 +201,9 @@ nanoGpt_RH/
 │
 ├── 📁 out/                      # TEMPORARY (gitignored)
 │
+├── 📁 runpod_workspace/         # ⚡ SSHFS mount to RunPod /workspace
+│   └── pair-correlation/        # Current experiment on pod
+│
 └── 📁 archive/                  # OLD CODE (gitignored)
 ```
 
@@ -229,7 +242,63 @@ ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519
 
 ---
 
-### Package & Send
+### 🚀 SSHFS Live Mount (РЕКОМЕНДУЕТСЯ!)
+
+**Лучший способ работы с RunPod** — примонтировать `/workspace` локально через SSHFS.
+Никакого `runpodctl send/receive`! Все файлы синхронизируются автоматически.
+
+**Установка macFUSE + SSHFS (один раз):**
+```bash
+brew install macfuse
+brew install gromgit/fuse/sshfs-mac
+```
+
+**Монтирование RunPod workspace:**
+```bash
+# Создай точку монтирования (один раз)
+mkdir -p runpod_workspace
+
+# Примонтируй (при каждом запуске пода)
+sshfs root@<POD_IP>:/workspace runpod_workspace/ -p <PORT> \
+  -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3
+
+# Пример:
+sshfs root@69.30.85.23:/workspace runpod_workspace/ -p 22022
+```
+
+**Проверка:**
+```bash
+mount | grep runpod  # должен показать macfuse mount
+ls runpod_workspace/  # видишь файлы с пода!
+```
+
+**Workflow с SSHFS:**
+```bash
+# Мониторинг тренировки в реальном времени
+tail -f runpod_workspace/pair-correlation/train_flash.log
+
+# Копирование результатов — просто cp!
+cp runpod_workspace/out/experiment/best.pt checkpoints/
+
+# Редактирование кода на поде — прямо из VS Code!
+code runpod_workspace/
+```
+
+**Отмонтирование:**
+```bash
+umount runpod_workspace/
+# или если завис:
+diskutil unmount force runpod_workspace/
+```
+
+**Текущий mount:**
+```
+runpod_workspace/ → root@69.30.85.23:/workspace (pair-correlation)
+```
+
+---
+
+### 📦 Package & Send (старый способ)
 ```bash
 tar czf runpod_package.tar.gz \
   src/train_mdn.py src/train_mdn_postfix.py \
@@ -370,4 +439,4 @@ s_n = Δ_n * log(γ_n) / (2π)
 
 ---
 
-*Last updated: 2026-01-01*
+*Last updated: 2026-01-02*
