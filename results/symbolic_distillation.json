@@ -1,0 +1,8 @@
+{
+  "best_equation": "complexity                                                    5\nloss                                                    0.13683\nequation                        (3.7897282 - s_m1) * 0.38065848\nscore                                                  0.040788\nsympy_format                      (3.7897282 - s_m1)*0.38065848\nlambda_format    PySRFunction(X=>(3.7897282 - s_m1)*0.38065848)\nName: 1, dtype: object",
+  "sympy": "(3.7897282 - s_m1)*0.38065848",
+  "corr_with_model": 0.3879916359209442,
+  "corr_with_true": 0.3473116946832799,
+  "mse_vs_model": 0.13682954742502176,
+  "mse_vs_true": 0.1512344713860819
+}

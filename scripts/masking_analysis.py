@@ -57,10 +57,22 @@ def load_model_and_data(ckpt_path: Path, data_dir: Path, device: str):
     model.load_state_dict(ckpt['model'], strict=False)
     model.eval()
 
+    # CRITICAL: Fix slot IDs during eval (permute_per_batch breaks inference!)
+    if hasattr(model, 'memory_bank') and hasattr(model.memory_bank, 'eval_slot_id_mode'):
+        model.memory_bank.eval_slot_id_mode = 'fixed'
+        console.print(f"[yellow]Set eval_slot_id_mode='fixed' for stable inference[/]")
+
     # Load data using SAME dataset as training (sliding windows!)
     console.print(f"[cyan]Loading validation data...[/]")
     val_raw = torch.load(data_dir / "val.pt", weights_only=False)
-    val_dataset = SpacingNextDataset(val_raw, seq_len=config.seq_len)
+
+    # CRITICAL FIX: config.seq_len ≠ dataset seq_len!
+    # In training: config.seq_len = args.seq_len - 1 + n_memory_slots (for positional embeddings)
+    # Dataset uses args.seq_len (input + target)
+    # So: correct_seq_len = config.seq_len + 1 - n_memory
+    correct_seq_len = config.seq_len + 1 - n_memory
+    console.print(f"[yellow]Using correct seq_len={correct_seq_len} (config.seq_len={config.seq_len}, n_memory={n_memory})[/]")
+    val_dataset = SpacingNextDataset(val_raw, seq_len=correct_seq_len)
     # Larger batch for GPU (512), num_workers=4 for faster loading
     batch_size = 512 if device == "cuda" else 256
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4 if device == "cuda" else 0)
@@ -106,12 +118,15 @@ def mask_by_magnitude(model, ratio: float):
 
 
 @torch.no_grad()
-def evaluate_nll(model, val_loader, device):
+def evaluate_nll(model, val_loader, device, max_batches: int = 0):
     """
     Evaluate NLL on data using the same method as training.
 
     POSTFIX model predicts ONE next spacing per sequence (bottleneck design).
     Uses BFloat16 on CUDA for speed.
+
+    Args:
+        max_batches: Limit eval to N batches (0 = all)
     """
     from train_mdn_postfix import mdn_loss_1step
 
@@ -136,24 +151,31 @@ def evaluate_nll(model, val_loader, device):
         total_nll += nll.item()
         n_batches += 1
 
+        # Early stop if max_batches reached
+        if max_batches > 0 and n_batches >= max_batches:
+            break
+
     return total_nll / n_batches
 
 
-def run_masking_analysis(model, val_loader, device, ratios):
+def run_masking_analysis(model, val_loader, device, ratios, max_batches: int = 0):
     """Run progressive masking analysis."""
     console.print("\n[bold cyan]═══ MASKING ANALYSIS ═══[/]\n")
+
+    if max_batches > 0:
+        console.print(f"[yellow]Using {max_batches} batches per eval (~{max_batches * 512:,} samples)[/]\n")
 
     results = []
 
     # Baseline
-    baseline_nll = evaluate_nll(model, val_loader, device)
+    baseline_nll = evaluate_nll(model, val_loader, device, max_batches)
     console.print(f"[green]Baseline NLL: {baseline_nll:.4f}[/]\n")
 
     for ratio in track(ratios, description="Testing mask ratios..."):
         masked_model = mask_by_magnitude(model, ratio)
         masked_model = masked_model.to(device)
 
-        nll = evaluate_nll(masked_model, val_loader, device)
+        nll = evaluate_nll(masked_model, val_loader, device, max_batches)
         delta = nll - baseline_nll
         pct_change = (delta / abs(baseline_nll)) * 100
 
@@ -219,6 +241,7 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=Path("data/continuous_2M"))
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "mps")
     parser.add_argument("--ratios", type=str, default="0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,0.95")
+    parser.add_argument("--max-batches", type=int, default=500, help="Max batches per eval (0=all)")
     args = parser.parse_args()
 
     ratios = [float(x) for x in args.ratios.split(",")]
@@ -237,7 +260,7 @@ def main():
     )
 
     baseline_nll, results = run_masking_analysis(
-        model, val_loader, device, ratios
+        model, val_loader, device, ratios, args.max_batches
     )
 
     display_results(baseline_nll, results)
