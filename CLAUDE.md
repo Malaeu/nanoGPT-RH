@@ -35,6 +35,7 @@ DOCS:
   docs/E4_SPEC.md                # E4 specification
   docs/runpod_specs.md           # GPU comparison
   docs/SPEED_OPTIMIZATION.md     # 🚀 GPU speed tricks (Ampere+)
+  docs/OPERATOR_EXTRACTION.md    # 🧬 Masters-inspired operator extraction
 
 FLASH CODE (новое):
   src/flash/                     # Flash-оптимизированные модели
