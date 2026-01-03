@@ -178,24 +178,37 @@ data/continuous_residuals/ # 200M zeros, residuals (mean=0)
 
 **Key finding:** Flash model has fundamentally different operator structure than E4.
 
-### Phase 2: Symbolic Distillation from Flash
+### Phase 2: Symbolic Distillation from Flash [IN PROGRESS]
 
 ```
-[ ] Extract MDN predictions (π, μ, σ)
-[ ] Run PySR with extended operators
-[ ] Test sinc, Bessel, and π-based formulas
+[x] Extract attention patterns from Layer 1
+    → All heads show relatively flat K(d) with small peaks
+    → L1.H7 shows exponential decay from d=1
+    → L1.H2 (most critical) is flat - works via different mechanism
+[x] Analyze prediction correlations
+    → Model achieves 0.94 correlation with targets
+    → MSE = 0.021
+[x] Test GUE repulsion hypothesis
+    → CONFIRMED! All lag correlations negative:
+       corr(rₙ, r₋₁) = -0.34 (strong repulsion!)
+       corr(rₙ, r₋₂) = -0.08
+       corr(rₙ, r₋₃) = -0.03
+[x] Extract linear operator
+    → rₙ ≈ -0.45·r₋₁ - 0.28·r₋₂ - 0.16·r₋₃
+    → All coefficients negative and decreasing = GUE-like!
+[ ] Run PySR for nonlinear terms (Julia issues)
+[ ] Test sinc kernel fit
+    → Preliminary: sinc²(πd/2.53), R²=0.81
 ```
 
-**Expected formula (from prior work):**
+**Discovered Linear Operator (GUE signature!):**
 ```
-              π
-     s_n ≈ ─────────────────
-           s₋₁ + s₋₂ + s₋₃
-```
+rₙ = -0.45·r₋₁ - 0.28·r₋₂ - 0.16·r₋₃ + ε
 
-Or more complex:
-```
-s_n = 1 + Σ a_k * sinc(π * k * (s_{n-1} - μ))
+Interpretation:
+- Negative coefficients = level repulsion
+- Decreasing magnitude = short-range dominance
+- Consistent with GUE pair correlation!
 ```
 
 ### Phase 3: Toeplitz Kernel Construction
