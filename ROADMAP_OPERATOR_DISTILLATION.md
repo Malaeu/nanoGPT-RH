@@ -211,6 +211,23 @@ Interpretation:
 - Consistent with GUE pair correlation!
 ```
 
+**Rollout Validation (January 2026):**
+```
+              Err@100   Mean Abs Error
+Linear Op:     0.310      0.334
+Flash Model:   0.241      0.335  (28.6% better)
+Baseline (0):  0.354      0.335
+
+Key findings:
+- Linear operator is STABLE (max |root| = 0.56 < 1)
+- Linear beats baseline → valid first approximation
+- Flash captures nonlinear terms → 28.6% improvement
+- Mean abs error identical → difference is in error accumulation
+```
+
+**Conclusion:** Linear operator is the first-order GUE approximation.
+Flash model adds higher-order corrections.
+
 ### Phase 3: Toeplitz Kernel Construction
 
 ```
