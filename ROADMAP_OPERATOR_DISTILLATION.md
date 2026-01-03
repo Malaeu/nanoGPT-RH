@@ -44,16 +44,30 @@ Constant: 3.1055553 ≈ π (1.1% error!)
 
 ### 1.4 Progressive Masking
 
+**E4 Model (postfix):**
 | Mask % | Active % | NLL | Status |
 |--------|----------|-----|--------|
 | 0% | 100% | 0.188 | Baseline |
 | **40%** | **60%** | **0.161** | **BEST (-14.5%)** |
 | 50% | 50% | 0.236 | Degraded |
 
-**Key insight:** 60% of weights contain 100%+ of knowledge. Model is over-parameterized.
+**Flash Model (residuals) - January 2026:**
+| Mask % | Active % | NLL | Status |
+|--------|----------|-----|--------|
+| 0% | 100% | -0.581 | Baseline |
+| 10% | 90% | -0.573 | OK (+1.4%) |
+| 20% | 80% | -0.543 | Degraded (+6.6%) |
+| **30%** | **70%** | **-0.477** | **CRITICAL (+17.9%)** |
+| 40% | 60% | -0.231 | BROKEN (+60%) |
+
+**Key insights:**
+- E4: 60% of weights contain knowledge (40% can be masked with IMPROVEMENT)
+- Flash: 70% of weights contain knowledge (more efficient, less over-parameterized)
+- Flash stores knowledge more densely than E4!
 
 ### 1.5 Attention Head Ablation
 
+**E4 Model (postfix tokenization):**
 ```
 Critical heads (removing them hurts):
   L0.H3: +106% NLL (PRIMARY)
@@ -64,7 +78,30 @@ Noise heads (removing them HELPS):
   L1-L2: -20% to -52% NLL
 ```
 
-**Core operator lives in Layer 0, Heads 2,3,5!**
+**Flash Model (residuals) - January 2026:**
+```
+LAYER 1 IS THE CORE OPERATOR (all heads critical!):
+  L1.H2: +312% NLL (MAIN OPERATOR)
+  L1.H3: +233% NLL
+  L1.H4: +120% NLL
+  L1.H7: +119% NLL
+  L1.H1: +108% NLL
+  L1.H0: +95%  NLL
+  L1.H5: +51%  NLL
+  L1.H6: +43%  NLL
+
+Layer importance (avg % NLL change):
+  Layer 1: +135% (SUPER CRITICAL)
+  Layer 2: +20%
+  Layer 0: +12%
+  Layer 3: +12%
+  Layer 4: +5%
+  Layer 5: +10%
+
+Only noise head: L3.H4 (-5.5%)
+```
+
+**Key insight: Flash concentrates operator in Layer 1, E4 used Layer 0!**
 
 ### 1.6 RMT Memory Effect
 
@@ -125,21 +162,21 @@ data/continuous_residuals/ # 200M zeros, residuals (mean=0)
 
 ## 4. Roadmap to Operator Distillation
 
-### Phase 1: Validate Flash Architecture [NEXT]
+### Phase 1: Validate Flash Architecture [DONE]
 
 ```
-[ ] Masking analysis on Flash model
-    → Find minimal core (expect 40-60%)
-[ ] Attention ablation on Flash model
-    → Identify critical heads
-[ ] Compare with E4 results
+[x] Masking analysis on Flash model
+    → 70% knowledge core (vs E4's 60%)
+    → Flash more efficient, less over-parameterized
+[x] Attention ablation on Flash model
+    → Layer 1 is THE core operator (all 8 heads critical!)
+    → L1.H2 most important (+312% NLL when removed)
+[x] Compare with E4 results
+    → E4: Layer 0 critical, Flash: Layer 1 critical
+    → Different architecture of knowledge!
 ```
 
-**Script:**
-```bash
-PYTHONPATH=flash:$PYTHONPATH python scripts/masking_analysis.py \
-  --ckpt out/mdn_memory_q3_flash/best.pt
-```
+**Key finding:** Flash model has fundamentally different operator structure than E4.
 
 ### Phase 2: Symbolic Distillation from Flash
 
@@ -174,11 +211,15 @@ s_n = 1 + Σ a_k * sinc(π * k * (s_{n-1} - μ))
 ### Phase 4: Operator Compression
 
 ```
-[ ] Prune to critical heads (L0.H2, H3, H5)
-[ ] Reduce to ~1.2M params (25% of original)
-[ ] Retrain minimal model
+[ ] Prune to critical Layer 1 (all 8 heads essential for Flash!)
+    → E4 could prune to 3 heads, Flash needs full Layer 1
+[ ] Remove noise head L3.H4 (only improves when removed)
+[ ] Reduce Layers 4-5 (only +5-10% avg impact)
+[ ] Retrain minimal model with 2-3 layers
 [ ] Verify symbolic formula still holds
 ```
+
+**Note:** Flash cannot be compressed as much as E4 - knowledge is denser.
 
 ### Phase 5: Mathematical Formalization
 
@@ -192,19 +233,25 @@ s_n = 1 + Σ a_k * sinc(π * k * (s_{n-1} - μ))
 
 ## 5. Key Questions to Answer
 
-1. **Does Flash model have same structure as E4?**
-   - Same critical heads?
-   - Same compression ratio?
+1. **~~Does Flash model have same structure as E4?~~** [ANSWERED]
+   - NO! Flash uses Layer 1 (all heads), E4 used Layer 0 (3 heads)
+   - Flash: 70% knowledge core, E4: 60%
+   - **Flash is fundamentally different architecture**
 
-2. **Is π-conservation universal?**
+2. **Why did residual training shift operator to Layer 1?**
+   - Centering at 0 vs mean=1: different feature space?
+   - RoPE vs learned positional: affects where computation happens?
+   - entropy_reg=0.01 vs 0.005: regularization shifts depth?
+
+3. **Is π-conservation universal?**
    - Test on different heights (γ ranges)
    - Test on other L-functions
 
-3. **Can we derive sinc kernel from attention?**
-   - Attention logits → pair correlation?
-   - Memory slots → global normalization?
+4. **Can we derive sinc kernel from Layer 1 attention?**
+   - Extract attention logits from L1.H2 specifically
+   - Compare with GUE sine kernel: sinc²(πd)
 
-4. **Why does Toeplitz fail for GUE?**
+5. **Why does Toeplitz fail for GUE?**
    - Need non-translation-invariant corrections?
    - Memory as symmetry breaker?
 
@@ -258,5 +305,5 @@ ablation_memory_slots.py         # Slot ablation
 
 ---
 
-*Last updated: 2026-01-03*
+*Last updated: 2026-01-03 (Phase 1 complete)*
 *Project: Neural Telescope for Riemann Hypothesis*
