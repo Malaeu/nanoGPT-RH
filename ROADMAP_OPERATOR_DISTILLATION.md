@@ -228,6 +228,18 @@ Key findings:
 **Conclusion:** Linear operator is the first-order GUE approximation.
 Flash model adds higher-order corrections.
 
+**GUE Theory Comparison (January 2026):**
+```
+              Our Model  GUE Theory  GUE Numerical
+Lag 1:         -0.34      -0.27       -0.29
+Lag 2:         -0.08      -0.06       -0.06
+Lag 3:         -0.03      -0.025      -0.02
+
+Our correlations are 20-50% STRONGER than pure GUE!
+→ Riemann zeros may have additional structure beyond GUE
+→ Arithmetic corrections to universality?
+```
+
 ### Phase 3: Toeplitz Kernel Construction
 
 ```
