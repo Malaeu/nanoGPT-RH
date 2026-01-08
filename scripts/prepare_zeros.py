@@ -191,9 +191,9 @@ def plot_distribution(spacings: np.ndarray, output_path: Path):
     ax.hist(spacings, bins=100, density=True, alpha=0.7,
             label="Unfolded spacings", color="steelblue")
 
-    # GUE Wigner surmise: P(s) = (π/2) s exp(-πs²/4)
+    # GUE Wigner surmise: P(s) = (32/π²) s² exp(-4s²/π), std ≈ 0.422
     s = np.linspace(0, 4, 500)
-    gue = (np.pi / 2) * s * np.exp(-np.pi * s**2 / 4)
+    gue = (32 / np.pi**2) * s**2 * np.exp(-4 * s**2 / np.pi)
     ax.plot(s, gue, 'r-', lw=2, label="GUE Wigner surmise")
 
     # Poisson: P(s) = exp(-s)
