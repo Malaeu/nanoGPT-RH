@@ -776,6 +776,43 @@ def train(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Weights & Biases initialization
+    if args.use_wandb:
+        try:
+            import wandb
+            run_name = args.wandb_run_name or f"{exp_name}_s{args.seed}_{args.slot_id_mode}"
+            wandb.init(
+                project=args.wandb_project,
+                name=run_name,
+                config={
+                    # Model
+                    "n_layer": args.n_layer,
+                    "n_head": args.n_head,
+                    "n_embd": args.n_embd,
+                    "n_components": args.n_components,
+                    "n_memory_slots": args.n_memory_slots,
+                    "slot_id_mode": args.slot_id_mode,
+                    "content_mode": args.content_mode,
+                    # Training
+                    "batch_size": args.batch_size,
+                    "lr": args.lr,
+                    "seq_len": args.seq_len,
+                    "max_steps": args.max_steps,
+                    "seed": args.seed,
+                    # Experiment
+                    "experiment": exp_name,
+                    "use_aux_loss": args.use_aux_loss,
+                    "use_ortho_loss": args.use_ortho_loss,
+                    "data_mode": args.data_mode,
+                    "device": str(device),
+                },
+                tags=[exp_name, args.slot_id_mode, args.data_mode],
+            )
+            console.print(f"[green]W&B initialized: {args.wandb_project}/{run_name}[/]")
+        except ImportError:
+            console.print("[yellow]wandb not installed, skipping W&B logging[/]")
+            args.use_wandb = False
+
     # Load data with streaming strategy (GPU-direct, mmap, or legacy DataLoader)
     train_batcher, val_batcher, data_info = load_data(
         data_dir=args.data_dir,
@@ -1045,6 +1082,18 @@ def train(args):
                 log_file.write(msg + '\n')
                 log_file.flush()
 
+                # W&B logging
+                if args.use_wandb:
+                    import wandb
+                    wandb.log({
+                        "train/nll": avg_train_nll,
+                        "val/nll": val_nll,
+                        "val/best_nll": best_val_nll,
+                        "train/speed_steps_sec": train_speed,
+                        "lr": scheduler.get_last_lr()[0],
+                        "step": step,
+                    }, step=step)
+
                 # Grokking: reset train_nll accumulators
                 train_nll_sum = 0.0
                 train_nll_count = 0
@@ -1167,6 +1216,18 @@ def train(args):
     log_file.write(f"  Time per step: {1000*total_time/total_steps:.2f} ms\n")
     log_file.close()
 
+    # W&B finish
+    if args.use_wandb:
+        import wandb
+        wandb.log({
+            "final/best_val_nll": best_val_nll,
+            "final/total_steps": total_steps,
+            "final/total_time_min": total_time / 60,
+            "final/steps_per_sec": avg_steps_per_sec,
+        })
+        wandb.finish()
+        console.print(f"[green]W&B run finished[/]")
+
     console.print(f"\n[green]Saved to: {out_dir}[/]")
 
 
@@ -1255,6 +1316,14 @@ def main():
                        help='Use torch.compile() for 20-30%% speedup (requires Ampere+ GPU)')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=1337)
+
+    # Weights & Biases
+    parser.add_argument('--use-wandb', action='store_true', default=False,
+                       help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='nanoGPT-RH',
+                       help='W&B project name')
+    parser.add_argument('--wandb-run-name', type=str, default=None,
+                       help='W&B run name (default: auto-generated)')
 
     args = parser.parse_args()
     train(args)
