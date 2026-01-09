@@ -1,0 +1,13 @@
+{
+  "checkpoint": "out/test_all_features/best.pt",
+  "n_samples": 254592,
+  "gue_comparison": {
+    "sine_kernel_correlation": 0.027207538676038284,
+    "exp_decay_tau5": 0.12290901664257227,
+    "exp_decay_tau10": 0.1157298044787175,
+    "exp_decay_tau20": 0.11011476719327007,
+    "mean_attention": 0.014159425431825233,
+    "std_attention": 0.032928027493748166
+  },
+  "pysr_results": {}
+}

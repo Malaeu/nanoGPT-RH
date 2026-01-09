@@ -11,17 +11,24 @@
 ```
 ✅ E4 COMPLETE — ID-Detox works!
 ⭐ Best Model: checkpoints/E4_s7_best.pt (NLL=0.1942)
-📍 Next: E5 (slot specialization) OR symbolic extraction
+🔬 TESTING: Is π real or bias artifact?
+   Model predictions: sₙ = 3.1084/(s₋₁+s₋₂+s₋₃) ← π!
+   True values (--target true): sₙ = 2.83/(...) ← NOT π!
+
+   Hypothesis: π = 2.92 × 1.062 (model bias creates π!)
+📍 Run 5 IN PROGRESS: PySR with --target true (~30 min remaining)
 ```
 
 ### Key Paths (ЗАПОМНИ!)
 ```
 INPUT:
-  data/continuous_2M/train.pt    # (7035, 256) training data
-  data/continuous_2M/val.pt      # (781, 256) validation data
+  data/continuous_500M/train.pt  # ⭐ (1.76M, 256) 500M zeros!
+  data/continuous_500M/val.pt    # (195K, 256) val_tail
+  data/continuous_2M/            # (legacy, 7K windows)
 
 CODE:
   src/train_mdn_postfix.py       # ⭐ Main training script
+  src/data_loading.py            # 🚀 Streaming DataLoader (gpu-direct/mmap)
   src/eval_mdn.py                # Evaluation
   src/diagnose_memory_postfix.py # Diagnostics
 
@@ -45,7 +52,158 @@ FLASH CODE (новое):
 
 FLASH DATA (180M точек!):
   src/data/flash_residuals/      # Residuals = spacings - 1.0
+
+LMFDB DATA (500M zeros!):
+  data/lmfdb_raw/                # Raw .dat files from LMFDB
+  data/continuous_500M/          # Processed train.pt, val.pt
+
+LAW-GRADE SCRIPTS (новое):
+  scripts/prepare_lmfdb_500M.py  # Download & process LMFDB zeros
+  scripts/eval_law.py            # Coverage/Width/Rollout eval
+  scripts/conformal_calibrate.py # Conformal interval calibration
+  scripts/symbolic_distill_quantiles.py  # Q0.1/Q0.5/Q0.9 → formulas
+  scripts/extract_operator.py    # 🧬 Operator extraction из attention
 ```
+
+---
+
+## 🚀 НОВЫЕ ФИЧИ (Jan 2026)
+
+### 1. Streaming DataLoader (`src/data_loading.py`)
+Три режима загрузки данных для масштабирования до 500M+ нулей:
+
+```bash
+# GPU-direct (данные на GPU, самый быстрый)
+python src/train_mdn_postfix.py --data-mode gpu-direct ...
+
+# MMap (ленивая загрузка с диска, экономит RAM)
+python src/train_mdn_postfix.py --data-mode mmap ...
+
+# Auto (автовыбор по размеру VRAM)
+python src/train_mdn_postfix.py --data-mode auto ...
+```
+
+**Классы:** `GPUDirectBatcher`, `MMapBatcher`, `DataLoaderWrapper`
+
+### 2. torch.compile() (20-30% speedup)
+Компиляция модели для GPU SM≥8.0 (Ampere+):
+
+```bash
+python src/train_mdn_postfix.py --use-compile ...
+```
+
+### 3. W&B Tracking (эксперименты)
+Логирование в Weights & Biases:
+
+```bash
+# Онлайн (нужен wandb login)
+python src/train_mdn_postfix.py --use-wandb --wandb-project nanoGPT-RH ...
+
+# Оффлайн
+WANDB_MODE=offline python src/train_mdn_postfix.py --use-wandb ...
+```
+
+### 4. Operator Extraction (`scripts/extract_operator.py`)
+Извлечение kernel K(s_i, s_j) из attention для сравнения с GUE:
+
+```bash
+python scripts/extract_operator.py \
+  --checkpoint checkpoints/E4_s7_best.pt \
+  --data-dir data/continuous_2M \
+  --output-dir results/operator_extraction \
+  --run-pysr  # опционально: символьная регрессия
+```
+
+**Выход:**
+- `kernel_visualization.png` — три графика attention patterns
+- `extraction_results.json` — корреляция с sine kernel, exp decay
+
+### 5. Conformal Calibration (`scripts/conformal_calibrate.py`)
+Калибровка confidence intervals для честных 90%:
+
+```bash
+python scripts/conformal_calibrate.py \
+  --ckpt checkpoints/E4_s7_best.pt \
+  --data-dir data/continuous_2M \
+  --alpha 0.1 \
+  --output results/calibrator.json
+```
+
+**Выход:** `adjustment_q` — поправка для расширения интервалов
+
+---
+
+## 📥 LMFDB 500M ZEROS DOWNLOAD
+
+### Источник данных
+- **URL:** https://beta.lmfdb.org/data/riemann-zeta-zeros/
+- **Precision:** ±2^{-102} (David Platt, Turing method verified)
+- **Format:** Binary delta-encoded (13 bytes per zero)
+- **Total:** 103.8 billion zeros available
+
+### Скачивание и препарация (одна команда!)
+```bash
+python scripts/prepare_lmfdb_500M.py --download --max-zeros 500
+
+# Флаги:
+--download          # Качает из LMFDB с cookie human=1
+--download-dir      # Куда качать raw .dat (default: data/lmfdb_raw)
+--max-zeros N       # В МИЛЛИОНАХ! (500=500M, 100=100M, 10=10M)
+--output-dir        # Куда сохранять train/val.pt
+```
+
+### Примеры:
+```bash
+# Быстрый тест (2M zeros, 1 файл)
+python scripts/prepare_lmfdb_500M.py --download --max-zeros 2 --output-dir data/test_2M
+
+# Средний датасет (100M zeros)
+python scripts/prepare_lmfdb_500M.py --download --max-zeros 100 --output-dir data/continuous_100M
+
+# Полный 500M (239 файлов)
+python scripts/prepare_lmfdb_500M.py --download --max-zeros 500
+
+# Использовать уже скачанные файлы
+python scripts/prepare_lmfdb_500M.py --input-dir data/lmfdb_raw --max-zeros 100
+```
+
+### Формат binary (delta encoding!)
+```python
+# Block header (32 bytes):
+t0, t1, Nt0, Nt1 = struct.unpack('<ddQQ', header)
+n_zeros = Nt1 - Nt0
+
+# Zero records (13 bytes each, DELTA encoded):
+Z = 0  # Accumulator
+for _ in range(n_zeros):
+    z1, z2, z3 = struct.unpack('<QIB', record)
+    delta = z1 + (z2 << 64) + (z3 << 96)
+    Z += delta  # ACCUMULATE!
+    gamma = t0 + Z * 2**(-101)
+```
+
+### Валидация spacings
+После unfolding (Variant B: u(γ) = γ/2π × log(γ/2πe)):
+- Mean ≈ 1.0 ✓
+- Std ≈ 0.41 ✓ (GUE)
+- Autocorr(1) < 0 ✓ (level repulsion)
+
+### Готовый датасет (Jan 2026)
+```
+data/continuous_500M/
+├── train.pt   [1,757,812 × 256] float32  # 1.8M windows!
+├── val.pt     [195,312 × 256] float32    # 195K windows (val_tail)
+└── meta.pt    hash=02fc584870ed65ac
+
+Statistics:
+  500M zeros processed
+  γ range: [14.13, 193,418,189]
+  Mean=1.0000, Std=0.4142, Autocorr=-0.357
+```
+
+**ВАЖНО:** Файлы должны сортироваться ЧИСЛОВЫМ порядком!
+- ❌ Алфавитный: zeros_101246000 < zeros_14 (WRONG!)
+- ✅ Числовой: zeros_14 < zeros_5000 < zeros_26000 (CORRECT!)
 
 ---
 
@@ -202,9 +360,6 @@ nanoGpt_RH/
 │
 ├── 📁 out/                      # TEMPORARY (gitignored)
 │
-├── 📁 runpod_workspace/         # ⚡ SSHFS mount to RunPod /workspace
-│   └── pair-correlation/        # Current experiment on pod
-│
 └── 📁 archive/                  # OLD CODE (gitignored)
 ```
 
@@ -243,63 +398,47 @@ ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519
 
 ---
 
-### 🚀 SSHFS Live Mount (РЕКОМЕНДУЕТСЯ!)
+### 🚀 SCP File Transfer (ИСПОЛЬЗУЕМ!)
 
-**Лучший способ работы с RunPod** — примонтировать `/workspace` локально через SSHFS.
-Никакого `runpodctl send/receive`! Все файлы синхронизируются автоматически.
+**Нативный SCP** — быстро, надёжно, не тормозит Mac.
+SSHFS/macFUSE удалены — они грузили систему.
 
-**Установка macFUSE + SSHFS (один раз):**
+**Upload на RunPod:**
 ```bash
-brew install macfuse
-brew install gromgit/fuse/sshfs-mac
+# Один файл
+scp -P <PORT> -i ~/.ssh/id_ed25519 local_file.py root@<IP>:/workspace/pair-correlation/
+
+# Несколько файлов
+scp -P <PORT> -i ~/.ssh/id_ed25519 scripts/*.py root@<IP>:/workspace/pair-correlation/scripts/
+
+# Целая папка
+scp -rP <PORT> -i ~/.ssh/id_ed25519 src/ root@<IP>:/workspace/pair-correlation/src/
 ```
 
-**Монтирование RunPod workspace:**
+**Download с RunPod:**
 ```bash
-# Создай точку монтирования (один раз)
-mkdir -p runpod_workspace
+# Один файл
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<IP>:/workspace/pair-correlation/results/file.json ./
 
-# Примонтируй (при каждом запуске пода)
-sshfs root@<POD_IP>:/workspace runpod_workspace/ -p <PORT> \
-  -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3
+# Чекпоинт
+scp -P <PORT> -i ~/.ssh/id_ed25519 root@<IP>:/workspace/pair-correlation/out/best.pt checkpoints/
 
-# Пример:
-sshfs root@69.30.85.23:/workspace runpod_workspace/ -p 22022
+# Целая папка
+scp -rP <PORT> -i ~/.ssh/id_ed25519 root@<IP>:/workspace/pair-correlation/results/ ./results/
 ```
 
-**Проверка:**
+**Пример с текущим подом:**
 ```bash
-mount | grep runpod  # должен показать macfuse mount
-ls runpod_workspace/  # видишь файлы с пода!
-```
+# Upload скрипта
+scp -P 22066 scripts/symbolic_distillation.py root@69.30.85.23:/workspace/pair-correlation/scripts/
 
-**Workflow с SSHFS:**
-```bash
-# Мониторинг тренировки в реальном времени
-tail -f runpod_workspace/pair-correlation/train_flash.log
-
-# Копирование результатов — просто cp!
-cp runpod_workspace/out/experiment/best.pt checkpoints/
-
-# Редактирование кода на поде — прямо из VS Code!
-code runpod_workspace/
-```
-
-**Отмонтирование:**
-```bash
-umount runpod_workspace/
-# или если завис:
-diskutil unmount force runpod_workspace/
-```
-
-**Текущий mount:**
-```
-runpod_workspace/ → root@69.30.85.23:/workspace (pair-correlation)
+# Download результатов
+scp -P 22066 root@69.30.85.23:/workspace/pair-correlation/results/*.json ./results/
 ```
 
 ---
 
-### 📦 Package & Send (старый способ)
+### 📦 Package & Send (альтернатива)
 ```bash
 tar czf runpod_package.tar.gz \
   src/train_mdn.py src/train_mdn_postfix.py \
