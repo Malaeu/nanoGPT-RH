@@ -59,6 +59,9 @@ console = Console()
 # Import base components from train_mdn (reuse existing blocks)
 from train_mdn import MDNConfig, CausalSelfAttention, MLP, Block, MDNHead, mdn_loss
 
+# Streaming data loading (GPU-direct, mmap, or legacy DataLoader)
+from data_loading import load_data
+
 
 # ============================================================================
 # POSTFIX MEMORY BANK
@@ -421,13 +424,13 @@ def mdn_loss_1step(pi: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor,
 # E5.5: MULTI-PERMUTATION EVAL
 # ============================================================================
 
-def eval_with_perm_average(model, val_loader, device, n_perms: int = 1):
+def eval_with_perm_average(model, val_batcher, device, n_perms: int = 1):
     """
     Evaluate model with optional multi-permutation averaging.
 
     Args:
         model: SpacingMDNPostfix model
-        val_loader: validation data loader
+        val_batcher: validation data batcher (iterable over (x, y) batches)
         device: torch device
         n_perms: number of permutations to average (1=fixed, >1=multi-perm)
 
@@ -442,8 +445,9 @@ def eval_with_perm_average(model, val_loader, device, n_perms: int = 1):
         # eval_slot_id_mode is already 'fixed' by default
         val_losses = []
         with torch.no_grad():
-            for vx, vy in val_loader:
-                vx, vy = vx.to(device), vy.to(device)
+            for vx, vy in val_batcher:
+                # Batcher already returns data on device (for GPU-direct)
+                # For DataLoaderWrapper, it handles .to(device) internally
                 vpi, vmu, vsigma = model(vx)
                 vloss = mdn_loss_1step(vpi, vmu, vsigma, vy, entropy_reg=0)
                 val_losses.append(vloss.item())
@@ -458,8 +462,7 @@ def eval_with_perm_average(model, val_loader, device, n_perms: int = 1):
         for i in range(n_perms):
             model.memory_bank.set_eval_perm_seed(42 + i)  # Reproducible seed per run
             perm_nlls = []
-            for vx, vy in val_loader:
-                vx, vy = vx.to(device), vy.to(device)
+            for vx, vy in val_batcher:
                 vpi, vmu, vsigma = model(vx)
                 vloss = mdn_loss_1step(vpi, vmu, vsigma, vy, entropy_reg=0)
                 perm_nlls.append(vloss.item())
@@ -655,6 +658,80 @@ def get_ortho_weight(step: int) -> float:
 
 
 # ============================================================================
+# ROLLOUT-SCORE (MASTER_SPEC §8.3)
+# ============================================================================
+
+def compute_quick_rollout_score(model, data, device, n_samples=200, batch_size=32):
+    """
+    Compute rollout-score for checkpoint selection.
+
+    rollout_score = CRPS_1 + 0.5 * slope
+    Lower is better.
+
+    This is a "quick" version for use during training - uses fewer samples
+    and shorter horizons than full eval.
+    """
+    model.eval()
+
+    # Sample subset
+    idx = torch.randint(0, len(data), (min(n_samples, len(data)),))
+    subset = data[idx].to(device)
+
+    with torch.no_grad():
+        # Compute one-step CRPS approximation
+        x = subset[:, :-1]
+        y = subset[:, 1:]
+
+        result = model(x)
+        if isinstance(result, tuple):
+            pi, mu, sigma = result[:3]
+        else:
+            pi, mu, sigma = result['pi'], result['mu'], result['sigma']
+
+        # Simple CRPS approximation via MAE to mean prediction
+        pred_mean = (pi * mu).sum(dim=-1)
+        crps_approx = torch.abs(pred_mean - y).mean().item()
+
+        # Quick rollout at h=50 and h=100
+        errors = {}
+        for h in [50, 100]:
+            rollout_errors = []
+            for i in range(0, len(subset), batch_size):
+                batch = subset[i:i+batch_size]
+                if batch.shape[1] < 128 + h:
+                    continue
+
+                context = batch[:, :128].clone()
+                for step in range(h):
+                    res = model(context)
+                    if isinstance(res, tuple):
+                        pi_t, mu_t, sigma_t = res[:3]
+                    else:
+                        pi_t, mu_t, sigma_t = res['pi'], res['mu'], res['sigma']
+                    pred = (pi_t[:, -1, :] * mu_t[:, -1, :]).sum(dim=-1, keepdim=True)
+                    context = torch.cat([context[:, 1:], pred], dim=1)
+
+                true_val = batch[:, 128 + h - 1]
+                pred_val = pred.squeeze(1)
+                mae = torch.abs(pred_val - true_val)
+                rollout_errors.append(mae.mean().item())
+
+            if rollout_errors:
+                errors[h] = np.mean(rollout_errors)
+
+        # Compute slope
+        if 50 in errors and 100 in errors:
+            slope = (errors[100] - errors[50]) / 50
+        else:
+            slope = 1.0  # Penalty for failed rollout
+
+        rollout_score = crps_approx + 0.5 * max(0, slope)
+
+    model.train()
+    return rollout_score, crps_approx, slope
+
+
+# ============================================================================
 # TRAINING
 # ============================================================================
 
@@ -678,7 +755,15 @@ def train(args):
     else:
         console.print("")
 
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    # Device selection: cuda > mps > cpu
+    if args.device == 'cuda' and torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif args.device == 'mps' and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif args.device not in ['cuda', 'mps', 'cpu']:
+        device = torch.device(args.device)  # custom device
+    else:
+        device = torch.device('cpu')
     console.print(f"[cyan]Device: {device}[/]")
 
     # Seed for reproducibility
@@ -691,42 +776,26 @@ def train(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load data
-    data_dir = Path(args.data_dir)
-    train_data = torch.load(data_dir / 'train.pt', weights_only=False)
-    val_data = torch.load(data_dir / 'val.pt', weights_only=False)
-
-    # Handle different data formats
-    if isinstance(train_data, dict):
-        train_data = train_data.get('data', train_data.get('spacings'))
-    if isinstance(val_data, dict):
-        val_data = val_data.get('data', val_data.get('spacings'))
-
-    console.print(f"[green]Train data: {train_data.shape}[/]")
-    console.print(f"[green]Val data: {val_data.shape}[/]")
-
-    # Create datasets (seq_len=257: 256 input + 1 target)
-    train_dataset = SpacingNextDataset(train_data, seq_len=args.seq_len)
-    val_dataset = SpacingNextDataset(val_data, seq_len=args.seq_len)
-
-    console.print(f"[green]Train samples: {len(train_dataset):,}[/]")
-    console.print(f"[green]Val samples: {len(val_dataset):,}[/]")
-
-    train_loader = DataLoader(
-        train_dataset,
+    # Load data with streaming strategy (GPU-direct, mmap, or legacy DataLoader)
+    train_batcher, val_batcher, data_info = load_data(
+        data_dir=args.data_dir,
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
+        device=device,
+        mode=args.data_mode,
+        seq_len=args.seq_len,
+        train_fraction=args.train_fraction,
+        num_workers=args.num_workers
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True
-    )
+
+    # Display data info
+    console.print(f"[green]Data mode: {data_info['mode']}[/]")
+    console.print(f"[green]Train samples: {data_info['train_samples']:,}[/]")
+    console.print(f"[green]Val samples: {data_info['val_samples']:,}[/]")
+    if 'gpu_memory_bytes' in data_info:
+        gpu_mb = data_info['gpu_memory_bytes'] / 1e6
+        console.print(f"[green]GPU data memory: {gpu_mb:.1f}MB[/]")
+    if data_info.get('train_fraction_applied'):
+        console.print(f"[yellow]Grokking mode: using {args.train_fraction*100:.0f}% of train data[/]")
 
     # Model config
     config = MDNConfig(
@@ -747,6 +816,19 @@ def train(args):
         content_mode=args.content_mode,
         use_aux_loss=args.use_aux_loss
     ).to(device)
+
+    # torch.compile() for 20-30% speedup (Ampere+ GPUs)
+    if args.use_compile and device.type == 'cuda':
+        try:
+            # Check if GPU supports compilation (SM >= 8.0 for best results)
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:
+                model = torch.compile(model, mode="reduce-overhead")
+                console.print(f"[green]torch.compile() enabled (SM {capability[0]}.{capability[1]})[/]")
+            else:
+                console.print(f"[yellow]torch.compile() skipped: SM {capability[0]}.{capability[1]} < 8.0[/]")
+        except Exception as e:
+            console.print(f"[yellow]torch.compile() failed: {e}[/]")
 
     # Set eval_slot_id_mode if explicitly provided (else stays None = same as training)
     if args.eval_slot_id_mode is not None:
@@ -774,7 +856,7 @@ def train(args):
     # Training loop
     step = 0
     best_val_nll = float('inf')
-    train_iter = iter(train_loader)
+    best_rollout_score = float('inf')  # For --select-by-rollout
 
     # Early stopping (E5: patience in STEPS, not eval iterations)
     best_step = 0
@@ -802,15 +884,13 @@ def train(args):
         last_eval_step = 0
         last_eval_time = start_time
 
-        while step < args.max_steps:
-            # Get batch
-            try:
-                x, y = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                x, y = next(train_iter)
+        # Grokking: track train_nll for curve analysis
+        train_nll_sum = 0.0
+        train_nll_count = 0
 
-            x, y = x.to(device), y.to(device)
+        while step < args.max_steps:
+            # Get batch (streaming: no iterator, direct GPU sampling)
+            x, y = train_batcher.get_batch()
 
             # E5.5: Time the training step
             train_step_start = time.time()
@@ -837,7 +917,8 @@ def train(args):
                         loss = mdn_loss_val + aux_weight * aux_loss_val
                     else:
                         pi, mu, sigma = model(x)
-                        loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                        mdn_loss_val = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                        loss = mdn_loss_val
 
                     # E5 STEP 2: Orthogonality loss on memory slots
                     if args.use_ortho_loss:
@@ -859,7 +940,8 @@ def train(args):
                     loss = mdn_loss_val + aux_weight * aux_loss_val
                 else:
                     pi, mu, sigma = model(x)
-                    loss = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                    mdn_loss_val = mdn_loss_1step(pi, mu, sigma, y, entropy_reg=args.entropy_reg)
+                    loss = mdn_loss_val
 
                 # E5 STEP 2: Orthogonality loss on memory slots
                 if args.use_ortho_loss:
@@ -872,6 +954,10 @@ def train(args):
                 optimizer.step()
 
             scheduler.step()
+
+            # Grokking: accumulate train_nll
+            train_nll_sum += mdn_loss_val.item()
+            train_nll_count += 1
 
             # E5.5: Accumulate train time
             train_time_total += time.time() - train_step_start
@@ -886,7 +972,7 @@ def train(args):
 
                 # E5.5: Use eval_with_perm_average for optional multi-perm eval
                 val_nll, val_std = eval_with_perm_average(
-                    model, val_loader, device, n_perms=args.eval_perm_average
+                    model, val_batcher, device, n_perms=args.eval_perm_average
                 )
 
                 # E5.5: Accumulate eval time
@@ -908,14 +994,41 @@ def train(args):
                     'experiment': exp_name
                 }
 
+                # ═══ Checkpoint selection logic ═══
+                # Default: select by val_nll
+                # With --select-by-rollout: select by rollout_score (at rollout_eval_freq intervals)
+
+                saved_by_nll = False
                 if val_nll < best_val_nll:
                     best_val_nll = val_nll
-                    best_step = step  # E5: track step, not counter
-                    torch.save(ckpt, out_dir / 'best.pt')
+                    if not args.select_by_rollout:
+                        best_step = step
+                        torch.save(ckpt, out_dir / 'best.pt')
+                        saved_by_nll = True
+
+                # Rollout-score based selection (Task 4 - Law-grade)
+                if args.select_by_rollout and step % args.rollout_eval_freq == 0:
+                    console.print(f"[cyan]Computing rollout score (H=100,200)...[/]")
+                    rollout_score = compute_quick_rollout_score(
+                        model, val_tensor, device,
+                        n_samples=200, batch_size=32
+                    )
+
+                    if rollout_score < best_rollout_score:
+                        best_rollout_score = rollout_score
+                        best_step = step
+                        ckpt['rollout_score'] = rollout_score
+                        torch.save(ckpt, out_dir / 'best.pt')
+                        console.print(f"[green]✓ New best rollout_score: {rollout_score:.4f}[/]")
+                    else:
+                        console.print(f"[dim]rollout_score: {rollout_score:.4f} (best={best_rollout_score:.4f})[/]")
 
                 # Log with E5.5 separate timing
                 elapsed = time.time() - start_time
                 steps_since_best = step - best_step
+
+                # Grokking: compute average train_nll since last eval
+                avg_train_nll = train_nll_sum / train_nll_count if train_nll_count > 0 else 0.0
 
                 # E5.5: Calculate train speed (excluding eval) and interval speed
                 train_speed = step / train_time_total if train_time_total > 0 else 0
@@ -923,12 +1036,18 @@ def train(args):
                 interval_time = time.time() - last_eval_time
                 interval_speed = interval_steps / interval_time if interval_time > 0 else 0
 
-                msg = f"Step {step}: val_nll={val_nll:.4f} (best={best_val_nll:.4f}) | train:{train_speed:.1f} s/s | int:{interval_speed:.1f} s/s | elapsed={elapsed/60:.1f}m"
+                msg = f"Step {step}: train_nll={avg_train_nll:.4f} | val_nll={val_nll:.4f} (best={best_val_nll:.4f}) | train:{train_speed:.1f} s/s | int:{interval_speed:.1f} s/s | elapsed={elapsed/60:.1f}m"
+                if args.select_by_rollout:
+                    msg += f" | rollout_best={best_rollout_score:.4f}"
                 if args.early_stop:
                     msg += f" | stale={steps_since_best}/{args.patience}"
                 console.print(f"[dim]{msg}[/]")
                 log_file.write(msg + '\n')
                 log_file.flush()
+
+                # Grokking: reset train_nll accumulators
+                train_nll_sum = 0.0
+                train_nll_count = 0
 
                 # E5.5: Update interval tracking
                 last_eval_step = step
@@ -992,6 +1111,9 @@ def train(args):
 
     console.print(f"\n[green]═══ Training Complete ═══[/]")
     console.print(f"Best val NLL: {best_val_nll:.4f}")
+    if args.select_by_rollout:
+        console.print(f"Best rollout score: {best_rollout_score:.4f}")
+        console.print(f"[dim](Checkpoint selected by rollout-score, not val_nll)[/]")
 
     # Timing Summary
     console.print(f"\n[bold cyan]⏱ Timing Summary:[/]")
@@ -1056,6 +1178,11 @@ def main():
                        help='Directory with train.pt and val.pt')
     parser.add_argument('--out-dir', type=str, required=True,
                        help='Output directory for checkpoints')
+    parser.add_argument('--train-fraction', type=float, default=1.0,
+                       help='Fraction of train data to use (0.3 = 30%%, for grokking)')
+    parser.add_argument('--data-mode', type=str, default='auto',
+                       choices=['auto', 'gpu-direct', 'mmap', 'dataloader'],
+                       help='Data loading strategy: auto (detect), gpu-direct (fastest), mmap (low RAM), dataloader (legacy)')
 
     # Model
     parser.add_argument('--n-layer', type=int, default=6)
@@ -1093,6 +1220,12 @@ def main():
     parser.add_argument('--patience', type=int, default=800,
                        help='Early stopping patience (E5: in training STEPS)')
 
+    # Rollout-score selection (MASTER_SPEC §8.3)
+    parser.add_argument('--select-by-rollout', action='store_true', default=False,
+                       help='Select best checkpoint by rollout-score instead of val_nll')
+    parser.add_argument('--rollout-eval-freq', type=int, default=1000,
+                       help='Evaluate rollout-score every N steps (expensive)')
+
     # E5: Orthogonality loss
     parser.add_argument('--use-ortho-loss', action='store_true', default=False,
                        help='Enable orthogonality loss on memory slots (E5 STEP 2)')
@@ -1118,6 +1251,8 @@ def main():
     # Hardware
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use-amp', action='store_true', default=True)
+    parser.add_argument('--use-compile', action='store_true', default=False,
+                       help='Use torch.compile() for 20-30%% speedup (requires Ampere+ GPU)')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--seed', type=int, default=1337)
 
