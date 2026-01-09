@@ -1,0 +1,14 @@
+{
+  "alpha": 0.1,
+  "adjustment_q": 1.0009961128234863,
+  "calib_size": 390,
+  "test_size": 391,
+  "raw_coverage_80": 0.08439897698209718,
+  "raw_coverage_90": 0.09743589743589744,
+  "raw_width_mean": 0.5074792504310608,
+  "calib_coverage": 0.9,
+  "test_coverage": 0.8951406649616368,
+  "test_width_mean": 2.507594347000122,
+  "coverage_ok": true,
+  "width_reasonable": false
+}
