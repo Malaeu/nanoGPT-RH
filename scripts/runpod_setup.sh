@@ -1,56 +1,121 @@
 #!/bin/bash
-# RunPod Setup Script for TASK_SPEC_2M
+# RunPod Setup Script — nanoGPT_RH (Jan 2026)
+# Полный пайплайн: установка → тренировка → extraction → calibration
 
-echo "=== RunPod Setup for TASK_SPEC_2M ==="
+set -e  # Остановиться при ошибке
 
-# 1. Install dependencies
-pip install torch numpy scipy matplotlib rich
+echo "═══════════════════════════════════════════════════════════════"
+echo "   nanoGPT_RH RunPod Setup (Jan 2026)"
+echo "═══════════════════════════════════════════════════════════════"
 
-# 2. Check GPU
-python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"No GPU\"}')"
+# ═══════════════════════════════════════════════════════════════
+# 1. УСТАНОВКА ЗАВИСИМОСТЕЙ
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "[1/6] Установка зависимостей..."
+pip install --quiet torch numpy scipy matplotlib rich wandb pysr
 
-# 3. Run training (OPTIMIZED: FlashAttention + torch.compile + large batch)
-echo "Starting SpacingMDN training (optimized)..."
-python train_mdn.py \
-    --data-dir data/continuous_2M \
-    --out-dir out/mdn_baseline \
-    --max-steps 20000 \
-    --batch-size 2048 \
-    --eval-interval 500 \
-    --save-interval 5000 \
-    --use-amp \
-    --compile
+# ═══════════════════════════════════════════════════════════════
+# 2. ПРОВЕРКА GPU
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "[2/6] Проверка GPU..."
+python -c "
+import torch
+if torch.cuda.is_available():
+    name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    cap = torch.cuda.get_device_capability()
+    compile_ok = '✅' if cap[0] >= 8 else '❌'
+    print(f'GPU: {name}')
+    print(f'VRAM: {vram:.1f} GB')
+    print(f'Compute: SM {cap[0]}.{cap[1]}')
+    print(f'torch.compile: {compile_ok} (needs SM >= 8.0)')
+else:
+    print('❌ GPU не найден!')
+    exit(1)
+"
 
-echo "Baseline training complete!"
+# ═══════════════════════════════════════════════════════════════
+# 3. ТРЕНИРОВКА E4 (POSTFIX + ID-Detox)
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "[3/6] Тренировка SpacingMDN+POSTFIX (E4 режим)..."
 
-# 4. Run eval (with reduced samples to avoid OOM during Memory Bank training)
-echo "Running eval suite..."
-python eval_mdn.py \
-    --ckpt out/mdn_baseline/best.pt \
-    --data-dir data/continuous_2M \
-    --output-dir reports/2M \
-    --n-pit 1000 \
-    --n-crps 1000 \
-    --rollout 100 \
-    --n-rollouts 16
+# Выбор датасета
+DATA_DIR="${DATA_DIR:-data/continuous_500M}"
+OUT_DIR="${OUT_DIR:-out/E5_runpod}"
+MAX_STEPS="${MAX_STEPS:-20000}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
 
-# 5. Train Memory Bank v2 (FULL: slot-ID + aux loss + AMP + compile)
-echo "Training Memory Bank v2 (slot-ID + aux loss)..."
-python train_mdn_memory.py \
-    --data-dir data/continuous_2M \
-    --out-dir out/mdn_memory_v2 \
-    --max-steps 10000 \
-    --batch-size 1024 \
-    --use-slot-id \
-    --aux-loss-weight 0.1 \
-    --use-amp \
-    --compile
+echo "  DATA_DIR: $DATA_DIR"
+echo "  OUT_DIR: $OUT_DIR"
+echo "  MAX_STEPS: $MAX_STEPS"
+echo "  BATCH_SIZE: $BATCH_SIZE"
 
-# 6. Run memory diagnostics
-echo "Running memory diagnostics..."
-python diagnose_memory.py \
-    --ckpt out/mdn_memory_v2/best.pt \
-    --data-dir data/continuous_2M \
-    --output-dir reports/2M
+python src/train_mdn_postfix.py \
+    --data-dir "$DATA_DIR" \
+    --out-dir "$OUT_DIR" \
+    --seed 7 \
+    --data-mode auto \
+    --use-compile \
+    --use-wandb \
+    --wandb-project nanoGPT-RH \
+    --slot-id-mode permute_per_batch \
+    --use-aux-loss \
+    --early-stop --patience 800 \
+    --max-steps "$MAX_STEPS" \
+    --eval-every 500 \
+    --batch-size "$BATCH_SIZE" \
+    --use-amp
 
-echo "=== All done! ==="
+echo "✅ Тренировка завершена!"
+
+# ═══════════════════════════════════════════════════════════════
+# 4. OPERATOR EXTRACTION
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "[4/6] Извлечение оператора из attention..."
+
+python scripts/extract_operator.py \
+    --checkpoint "$OUT_DIR/best.pt" \
+    --data-dir "$DATA_DIR" \
+    --output-dir "$OUT_DIR/operator_extraction" \
+    --n-samples 10000 \
+    --device cuda
+
+echo "✅ Operator extraction завершён!"
+
+# ═══════════════════════════════════════════════════════════════
+# 5. CONFORMAL CALIBRATION
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "[5/6] Conformal калибровка интервалов..."
+
+python scripts/conformal_calibrate.py \
+    --ckpt "$OUT_DIR/best.pt" \
+    --data-dir "$DATA_DIR" \
+    --alpha 0.1 \
+    --output "$OUT_DIR/calibrator.json"
+
+echo "✅ Калибровка завершена!"
+
+# ═══════════════════════════════════════════════════════════════
+# 6. ИТОГИ
+# ═══════════════════════════════════════════════════════════════
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "   ГОТОВО!"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Результаты в $OUT_DIR:"
+echo "  - best.pt                 — лучшая модель"
+echo "  - operator_extraction/    — kernel визуализация"
+echo "  - calibrator.json         — conformal поправка"
+echo ""
+echo "Скачать результаты:"
+echo "  runpodctl send $OUT_DIR"
+echo ""
+echo "W&B dashboard:"
+echo "  wandb sync wandb/offline-run-*"
+echo ""
